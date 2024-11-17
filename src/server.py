@@ -1,10 +1,24 @@
 import dataclasses
 import socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import random
 from typing import Optional, List
 import logging
 import argparse
+
+import requests
+
+
+class NodeHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        """Handle POST requests to process incoming messages."""
+        content_length = int(self.headers['Content-Length'])
+        msg = self.rfile.read(content_length)
+        handle_message(self.server.node_state, msg)
+        logging.info(f"Node {self.server.node_state.node_id} received: {msg}")
+        self.send_response(200)
+        self.end_headers()
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -25,40 +39,41 @@ class NodeStatus:
 
 
 def start_node(node: NodeStatus) -> NodeStatus:
-    node.running = True
-    logging.info(f"Starting node at port {node.port}")
+    class HTTPServerWithState(HTTPServer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.node_state = node
 
-    # Starts listening for messages on a separate thread
-    threading.Thread(target=lambda : listen_for_messages(node), daemon=True).start()
+    node.running = True
+    server = HTTPServerWithState(("localhost", node.port), NodeHTTPRequestHandler)
+    logging.info(f"http server for node {node.node_id} running on port {node.port}")
+
+    def serve_forever():
+        while node.running:
+            server.handle_request()
+
+    threading.Thread(target=serve_forever, daemon=True).start()
     return node
 
 
-# TODO: ideally, it would be nice to have a more http-like setup.
-#       this is far too much work for too little benefit
-def listen_for_messages(node: NodeStatus) -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
-        server_socket.bind(("localhost", node.port))
-        print(f"Node {node.node_id} listening on port {node.port}")
-        while node.running:
-            try:
-                message, address = server_socket.recvfrom(1024)
-                handle_message(node, message, address)
-            except socket.error as e:
-                logging.error(e)
-                continue
-
-
-def handle_message(node: NodeStatus, msg: bytes | str, address):  # TODO: Find Address type
+def handle_message(node: NodeStatus, msg: bytes | str):  # TODO: Find Address type
     # TODO: Find a way to convert the recived address to something more useful
-    logging.info(f"Message received from server {address}: {msg}")
+    logging.info(f"Message received: {msg}")
     # Also make sure that we do something with the recieved message
 
 
 def send_message(node: NodeStatus, target: int, msg: str | bytes):
     if random.random() < node.message_success_rate:
         logging.debug(f"sending message to {target} with contents: {msg}")
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
-            client.sendto(msg.encode() if type(msg) is str else msg, ("localhost", target_port))
+        url = f"http://localhost:{target}"
+        try:
+            response = requests.post(url, msg)
+            if response.status_code == 200:
+                logging.info("recieved success!")
+            else:
+                logging.info("oh no!")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"unable to send message to {target}!", e)
     else:
         logging.info(f"droppping message intended for {target} with contents: {msg}")
 
@@ -88,11 +103,12 @@ if __name__ == "__main__":
         message_success_rate=1.0,
         peers=args.peers or []
     )
-    start_node(node)
+    node = start_node(node)
 
     try:
         while True:
-            command = input(f"Node {node.node_id}> ").strip()
+            print(f"Node {node.node_id}> ", end="")
+            command = input().strip()
             match command.split():
                 case ["send", target, *message]:
                     try:
