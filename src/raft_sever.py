@@ -90,6 +90,3 @@ def server_loop():
     raise NotImplementedError("Yet to implement core server loop")
     pass
 
-
-def main():
-    
