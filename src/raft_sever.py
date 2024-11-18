@@ -2,6 +2,7 @@ import enum
 import dataclasses
 from typing import Optional, List, Dict
 
+import rpc
 
 class ServerStatus(enum.Enum):
     """
@@ -42,7 +43,7 @@ class PersistantServerState:
     # NOTE: currently a string, would be nice to convert
     #       to nicely typed stuff so we know that there are
     #       no bugs hidden
-    log: List[str]
+    log: List[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -67,6 +68,14 @@ class VolatileLeaderState:
 
 @dataclasses.dataclass
 class ServerState:
+    # (Updated on stable storage before responding to RPCs)
+    persistant_state: PersistantServerState
+    # (Reinitialized after election)
+    # NOTE: We leave it None for any state that is not a leader.
+    #       This also implies leaving it undefined on startup, since
+    #       by default, every server is a follower on startup
+    leader_state: Optional[VolatileLeaderState] = None
+
     # index of highest log entry known to be
     # committed (initialized to 0, increases
     # monotonically)
@@ -76,17 +85,13 @@ class ServerState:
     # monotonically
     last_applied: int = 0
 
-    # (Updated on stable storage before responding to RPCs)
-    persistant_state: PersistantServerState = PersistantServerState()
-    # (Reinitialized after election)
-    # NOTE: We leave it None for any state that is not a leader.
-    #       This also implies leaving it undefined on startup, since
-    #       by default, every server is a follower on startup
-    leader_state: Optional[VolatileLeaderState] = None
-
 
 def server_loop():
     # Runs the FSM that controlls the server
     raise NotImplementedError("Yet to implement core server loop")
     pass
 
+
+@rpc.rpc_call
+def ElectServer() -> None:
+    return None
