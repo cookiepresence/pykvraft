@@ -32,12 +32,6 @@ class SingletonMixin(object):
 
     @classmethod
     def instance(cls, *args, **kwargs):
-        print("-----------------------")
-        print(cls.__singleton_instance)
-        import traceback
-        traceback.print_stack(limit=10)
-        print('-----------------------')
-        print()
         if cls.__singleton_instance is None:
             cls.__singleton_instance = cls(*args, **kwargs)
         return cls.__singleton_instance
@@ -53,9 +47,6 @@ class Node(SingletonMixin):
     message_success_rate: float = 1.0
 
     _endpoints: Dict = dataclasses.field(default_factory=dict)
-
-    def __post_init__(self):
-        print(f"creating a new node: {self.node_id}")
 
     def start(self):
         if self.running:

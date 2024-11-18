@@ -5,7 +5,6 @@ import raft_sever
 import node
 
 
-print("Hello world!")
 node = node.Node.instance(node_id='node1')
 
 if __name__ == "__main__":

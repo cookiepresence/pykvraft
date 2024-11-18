@@ -12,6 +12,7 @@ from mashumaro.codecs.json import json_decode, json_encode
 
 import server
 
+
 def rpc_call(func: Callable[[int, ...], Any]):
     # the endpoint of the function is the name of the function itself.
     endpoint = func.__name__.replace('_', '-')
