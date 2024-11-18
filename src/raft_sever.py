@@ -94,4 +94,4 @@ def server_loop():
 
 @rpc.rpc_call
 def ElectServer() -> None:
-    return None
+    return b"Hello world"
