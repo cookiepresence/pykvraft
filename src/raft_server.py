@@ -92,3 +92,9 @@ def server_loop():
     raise NotImplementedError("Yet to implement core server loop")
     pass
 
+
+@rpc.rpc_call
+def Hello(name: str) -> str:
+    import time
+    time.sleep(10)
+    return f"Hello {name}!"

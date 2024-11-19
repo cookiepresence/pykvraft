@@ -1,16 +1,16 @@
 import logging
+logging.basicConfig(level=logging.INFO)
+
 import argparse
+import raft_server
 
-import raft_sever
 import node
-
 import rpc
+
 
 node = node.Node.instance()
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
     parser = argparse.ArgumentParser(description="Start a Raft Node")
     parser.add_argument("--node-id", type=str, required=True, help="Node ID", dest="node_id")
     parser.add_argument("--port", type=int, required=True, help="Port to listen on")
@@ -45,6 +45,9 @@ if __name__ == "__main__":
                 case ["stop"]:
                     node.stop()
                     break
+                case ["hello", target, name, times]:
+                    for _ in range(int(times)):
+                        raft_server.Hello(int(target), name)
                 case _:
                     print("Unknown command. Use 'send <target_port> to <endpoint> <message>' or 'stop'.")
     except KeyboardInterrupt:

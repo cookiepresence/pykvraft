@@ -2,6 +2,7 @@ import logging
 import functools
 import inspect
 import sys
+import concurrent.futures
 
 from typing import Any, NamedTuple, Optional
 from collections.abc import Callable
@@ -95,6 +96,7 @@ def rpc_call(func: Callable[[int, ...], Any], ):
 
         # Make the actual request
         assert __port in node.node.peers
+
         msg_content = node.node.send_message(target=__port, endpoint=endpoint, msg=msg)
         return_vals = msgpack_decode(msg_content, return_annotation) if msg_content is not None else None
         return return_vals

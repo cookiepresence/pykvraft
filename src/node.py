@@ -3,12 +3,12 @@ import dataclasses
 import threading
 import random
 import requests
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import http.server
 
 from typing import Optional, List, Dict, Tuple
 
 
-class NodeHTTPRequestHandler(BaseHTTPRequestHandler):
+class NodeHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers['Content-Length'])
         msg = self.rfile.read(content_length)
@@ -53,7 +53,7 @@ class Node(SingletonMixin):
             logging.info(f"Node {self.node_id} is already running.")
             return
 
-        class HTTPServerWithNode(HTTPServer):
+        class HTTPServerWithNode(http.server.ThreadingHTTPServer):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.node = Node.instance()
