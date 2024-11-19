@@ -4,6 +4,7 @@ from typing import Optional, List, Dict
 
 import rpc
 
+
 class ServerStatus(enum.Enum):
     """
 Ref: Figure 4, Section 5 of the Raft Paper.
@@ -91,7 +92,3 @@ def server_loop():
     raise NotImplementedError("Yet to implement core server loop")
     pass
 
-
-@rpc.rpc_call
-def ElectServer() -> None:
-    return b"Hello world"

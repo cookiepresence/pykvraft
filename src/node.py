@@ -78,8 +78,10 @@ class Node(SingletonMixin):
     def handle_message(self, endpoint: str, msg: bytes) -> Tuple[Optional[int], Optional[bytes]]:
         # send message to correct function based on input
         logging.info(f"Received message from endpoint {endpoint}: {msg}")
-        logging.info("")
-        return b'Hello world!'
+        if endpoint not in self._endpoints:
+            return None
+        else:
+            return self._endpoints[endpoint](msg)
 
     def send_message(self, target: int, endpoint: str, msg: str | bytes) -> Optional[bytes]:
         if not self.running:
@@ -105,3 +107,5 @@ class Node(SingletonMixin):
         else:
             logging.info(f"Dropping message intended for {target} with contents: {msg}")
             return None
+
+node = Node.instance()

@@ -4,8 +4,9 @@ import argparse
 import raft_sever
 import node
 
+import rpc
 
-node = node.Node.instance(node_id='node1')
+node = node.Node.instance()
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
@@ -18,7 +19,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # set all required params
-    assert node.node_id == 'node1'
     node.node_id = args.node_id
     node.port = args.port
     node.peers = args.peers
@@ -45,9 +45,6 @@ if __name__ == "__main__":
                 case ["stop"]:
                     node.stop()
                     break
-                case ["elect", target]:
-                    out = raft_sever.ElectServer(int(target))
-                    print(f"Elected successfully! output: {out}")
                 case _:
                     print("Unknown command. Use 'send <target_port> to <endpoint> <message>' or 'stop'.")
     except KeyboardInterrupt:
