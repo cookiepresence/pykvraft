@@ -49,6 +49,8 @@ if __name__ == "__main__":
                             print(f"Failed to send message to {target}:{endpoint}.")
                     except ValueError:
                         print(f"Invalid target port: {target}")
+                case ["start", "raft"]:
+                    raft.running = True
                 case ["stop"]:
                     node_instance.stop()
                     break

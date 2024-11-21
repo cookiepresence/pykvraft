@@ -1,14 +1,14 @@
 import enum
 import dataclasses
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import threading
 import time
 import random
 import logging
 import json
+import concurrent.futures
 
-import node
-
+import rpc
 
 class ServerStatus(enum.Enum):
     """
@@ -208,7 +208,7 @@ class RaftServer:
                                             leader.
     """
 
-    def __init__(self, node_id: str, peers: List[int]):
+    def __init__(self, node_id: str, peers: List[int], min_election_timeout=1.0, max_election_timeout=2.0):
         """
         Initializes the RaftServer with the given node ID and peer ports.
 
@@ -220,42 +220,66 @@ class RaftServer:
             node_id (str): The unique identifier for this Raft server.
             peers (List[int]): A list of peer ports representing other nodes
                                in the cluster.
+            min_election_timeout (float): The minimum time (in seconds) for a
+                                          term to last without receiving any
+                                          messages, after which an election
+                                          would start. (default: 1.0 seconds)
+            max_election_timeout (float): The maximum time (in seconds) for a
+                                          term to last without receiving any
+                                          messages, after which an election
+                                          would start. (default: 2.0 seconds)
         """
-        self.node = node.Node.instance()
-        self.node_id = node_id
-        self.peers = peers
-        self.status = ServerStatus.Follower
-        self.state = ServerState(persistant_state=PersistantServerState())
+        # TODO: separate it out into a separate class
+        self.node_id: str = node_id
+        self.peers: List[int] = peers
+        self.running = True
+
+        self.status: ServerStatus = ServerStatus.Follower
+        self.state: ServerState = ServerState(persistant_state=PersistantServerState())
+
+        self.min_election_timeout = min_election_timeout
+        self.max_election_timeout = max_election_timeout
 
         self.leader_id: Optional[str] = None
-        self.election_timeout = self.reset_election_timeout()
-        self.heartbeat_interval = 0.1
+        self.election_timeout: float = self.reset_election_timeout()
+        self.heartbeat_interval: float = 0.1
 
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
         self.election_timer = threading.Thread(
             target=self.run_election_timer, daemon=True
         )
         self.election_timer.start()
-        self.heartbeat_timer = threading.Thread(
-            target=self.run_heartbeat_timer, daemon=True
-        )
-        self.heartbeat_timer.start()
 
-        self.node.register_endpoint("RequestVote", self.handle_request_vote)
-        self.node.register_endpoint("AppendEntries", self.handle_append_entries)
+        # TODO: Do not start the heartbeat thread whenever, it should
+        # be only when the leader is elected
+        # self.heartbeat_timer = threading.Thread(
+        #     target=self.run_heartbeat_timer, daemon=True
+        # )
+        # self.heartbeat_timer.start()
+
+        # requrired for the RPC setup
+        for attr_name in dir(self):
+            attr = getattr(self, attr_name)
+            if callable(attr) and hasattr(attr, "rpc_bind_handler"):
+                attr.rpc_bind_handler(self)
+
+        # self.node.register_endpoint("RequestVote", self.handle_request_vote)
+        # self.node.register_endpoint("AppendEntries", self.handle_append_entries)
 
     def reset_election_timeout(self) -> float:
         """
         Resets the election timeout by setting it to a future timestamp.
 
-        The election timeout is randomized between 1.0 and 2.0 seconds to
-        reduce the likelihood of split votes during leader elections.
+        The election timeout is randomized to reduce the likelihood of split
+        votes during leader elections.
 
         Returns:
             float: The new election timeout timestamp.
         """
-        return time.time() + random.uniform(1.0, 2.0)
+        # TODO: Ideally, do not rely on the system clock. time.time() is not
+        # monotonic or precise
+        return time.time() + random.uniform(self.min_election_timeout, self.max_election_timeout)
 
     def run_election_timer(self):
         """
@@ -266,8 +290,14 @@ class RaftServer:
         the current time has exceeded the election timeout. If so, it triggers
         the election process.
         """
-        while self.node.running:
+        logging.info("starting election timer!")
+        while self.running:
+            # NOTE: likely bug! the election blocks the running of the timer, killing it
+            # in the process. ideally, we would want the election to be on a separate
+            # thread. The election thread can run independently, and only change states
+            # by acquiring locks
             with self.lock:
+                # TODO: change to monotonic timers
                 if time.time() >= self.election_timeout:
                     self.start_election()
             time.sleep(0.05)
@@ -280,11 +310,117 @@ class RaftServer:
         server's status. If the server is the leader, it sends heartbeats at
         the defined heartbeat interval.
         """
-        while self.node.running:
+        while self.running:
             with self.lock:
                 if self.status == ServerStatus.Leader:
                     self.send_heartbeats()
             time.sleep(self.heartbeat_interval)
+
+    def is_incoming_log_up_to_date(self, last_log_index: int, last_log_term: int) -> bool:
+        """Checks if incoming log is atleast as up-to-date as the local log.
+
+        [ref: Raft paper, section 5.4.1, pg 8]
+        Raft determines which of two logs is more up-to-date
+        by comparing the index and term of the last entries in the
+        logs. If the logs have last entries with different terms, then
+        the log with the later term is more up-to-date. If the logs
+        end with the same term, then whichever log is longer is
+        more up-to-date.
+
+        Args:
+             last_log_index (int): Last log index of the incoming log.
+             last_log_term (int):  Term of the last log index of the
+                                   incoming node.
+        """
+        with self.lock:
+            self_last_log_term = (
+                self.state.persistant_state.log[-1]["term"]
+                if self.state.persistant_state.log
+                else 0
+            )
+            self_last_log_index = (
+                len(self.state.persistant_state.log)
+                if self.state.persistant_state.log
+                else 0
+            )
+            # If the logs have last entries with different terms, then
+            # the log with the later term is more up-to-date.
+            if self_last_log_term < last_log_term:
+                logging.debug(
+                    "incoming log is up-to-date with more terms "
+                    f"[{last_log_term} terms vs {self_last_log_term} terms]"
+                )
+                return True
+            # If the logs end with the same term, then whichever log is longer
+            # is more up-to-date.
+            if (
+                    self_last_log_term == last_log_term and
+                    self_last_log_index <= last_log_index
+            ):
+                logging.debug(
+                    "incoming log is more up-to-date with more entries "
+                    f"[{last_log_index} entries vs {self_last_log_index} entries]"
+                )
+                return True
+            # Since none of the earlier conditions match, our own log is more up
+            # to date.
+            logging.debug(
+                "incoming log is out-of-date with less terms and less entries "
+                f"[{last_log_term} terms vs {self_last_log_term} terms] "
+                f"[{last_log_index} entries vs {self_last_log_index} entries]"
+            )
+            return False
+
+    @rpc.rpc_call(is_class_method=True)
+    def RequestVote(self, term: int, candidate_id: str, last_log_index: int, last_log_term: int) -> Tuple[int, bool]:
+        with self.lock:
+            current_term = self.state.persistant_state.current_term
+            voted_for = self.state.persistant_state.voted_for
+
+            # (§5.1) Reply false if term < current term
+            if term < current_term:
+                logging.debug(
+                    f"Vote rejected for {candidate_id} in term {term} "
+                    f"(current term {current_term})"
+                )
+                return (current_term, False)
+
+            # (§5.1) [All servers] If RPC request or response contains
+            # term T > currentTerm:
+            # set currentTerm = T, convert to follower
+            if term > current_term:
+                logging.debug(
+                    "Updating"
+                    f" term {current_term} -> {term};"
+                    f" state {self.status} -> {ServerStatus.Follower}"
+                )
+                self.state.persistant_state.current_term = term
+                self.state.persistant_state.voted_for = None
+                self.status = ServerStatus.Follower
+                current_term = term
+                voted_for = None
+
+            # (§5.2, §5.4) If votedFor is null or candidateId,...
+            if (voted_for is not None and voted_for != candidate_id):
+                logging.info(
+                    f"Vote rejected for {candidate_id} "
+                    f"(Already voted for {voted_for} in {current_term})")
+                return (current_term, False)
+            # ...and candidate's log is atleast as up-to-date as receiver's
+            # log: grant vote
+            if ((voted_for is None
+                 or voted_for == candidate_id) and
+                self.is_incoming_log_up_to_date(last_log_index, last_log_term)):
+                logging.info(f"Vote granted to {candidate_id}")
+                self.reset_election_timeout()
+                return (current_term, True)
+            else:
+                logging.info(
+                    f"Vote rejected for {candidate_id} "
+                    f"(incoming log out of date wrt our own log)"
+                )
+                return (current_term, False)
+
 
     def start_election(self):
         """
@@ -294,73 +430,77 @@ class RaftServer:
         The server increments its current term, votes for itself, and solicits
         votes from peers. If a majority of votes is obtained, it becomes the
         leader; otherwise, it reverts to Follower.
+
+        ref: Raft paper, Section 5.2, pg 5
         """
-        self.status = ServerStatus.Candidate
-        self.state.persistant_state.current_term += 1
-        self.state.persistant_state.voted_for = self.node_id
+        #  If a follower receives no communication over a period of time
+        # called the election timeout, then it assumes there is no vi-
+        # able leader and begins an election to choose a new leader.
         self.reset_election_timeout()
-        votes_granted = 1  # Vote for self
+
+        # To begin an election, a follower increments its current term...
+        self.state.persistant_state.current_term += 1
+        current_term = self.state.persistant_state.current_term
+        # ...and transitions to candidate state
+        self.status = ServerStatus.Candidate
+        # It then votes for itself...
+        self.state.persistant_state.voted_for = self.node_id
+        # note: implicit vote counted for self.
+        votes_granted = 0
 
         logging.info(
-            f"Node {self.node_id} is now a Candidate for term {self.state.persistant_state.current_term}"
+            f"Node {self.node_id} is now a Candidate for term "
+            f"{self.state.persistant_state.current_term}"
         )
 
-        vote_lock = threading.Lock()
+        num_peers = len(self.peers)
+        last_log_index = len(self.state.persistant_state.log)
+        last_log_term = (
+            self.state.persistant_state.log[-1]["term"]
+            if last_log_index > 0
+            else 0
+        )
 
-        def request_vote(peer_port):
-            nonlocal votes_granted
-            try:
-                last_log_index = len(self.state.persistant_state.log)
-                last_log_term = (
-                    self.state.persistant_state.log[-1]["term"]
-                    if last_log_index > 0
-                    else 0
-                )
-                payload = {
-                    "term": self.state.persistant_state.current_term,
-                    "candidate_id": self.node_id,
-                    "last_log_index": last_log_index,
-                    "last_log_term": last_log_term,
-                }
-                response = self.node.send_message(
-                    peer_port, "RequestVote", json.dumps(payload).encode()
-                )
-                if response:
-                    resp = json.loads(response.decode())
-                    if resp.get("vote_granted"):
-                        with vote_lock:
-                            votes_granted += 1
-                            logging.info(
-                                f"Node {self.node_id} received vote from peer {peer_port}"
-                            )
-                    if resp.get("term", 0) > self.state.persistant_state.current_term:
-                        with self.lock:
-                            self.state.persistant_state.current_term = resp["term"]
-                            self.status = ServerStatus.Follower
-                            self.state.persistant_state.voted_for = None
-                            logging.info(
-                                f"Node {self.node_id} found higher term {resp['term']} from peer {peer_port}, reverting to Follower"
-                            )
-            except Exception as e:
-                logging.error(f"Error requesting vote from peer {peer_port}: {e}")
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            for peer, vote in zip(self.peers, executor.map(
+                    self.RequestVote,
+                    self.peers,
+                    [self.state.persistant_state.current_term] * num_peers,
+                    [self.node_id] * num_peers,
+                    [last_log_index] * num_peers,
+                    [last_log_term] * num_peers
+            )):
+                if vote is not None:
+                    (term, vote) = vote
+                    # (§5.1) [All servers] If RPC request or response contains
+                    # term T > currentTerm:
+                    # set currentTerm = T, convert to follower
+                    if term > current_term:
+                        # TODO: Check if the state has not drifted [acquire lock]...
+                        self.status = ServerStatus.Follower
+                        logging.debug(
+                            f"breaking out of the election and returning to Follower "
+                            f"(received {term},"
+                            f" greater than {self.state.persistant_state.current_term})"
+                        )
+                    logging.info(f"vote recieved from {peer}")
+                    votes_granted += 1 if vote else 0
+                    # If at any point we have enough votes for a majority, we
+                    # can proceed with the leader election
+                    if votes_granted > len(self.peers) // 2:
+                        break
+                else:
+                    # Erorred out mid-way, ignore the result
+                    pass
 
-        threads = []
-        for peer in self.peers:
-            t = threading.Thread(target=request_vote, args=(peer,))
-            t.start()
-            threads.append(t)
-
-        for t in threads:
-            t.join()
-
-        with vote_lock:
-            current_votes = votes_granted
-
-        if current_votes > len(self.peers) // 2:
+        # A candidate wins an election if it receives votes from
+        # a majority of the servers in the full cluster for the same term
+        if votes_granted > len(self.peers) // 2:
+            # TODO: acquire lock!
             self.status = ServerStatus.Leader
             self.leader_id = self.node_id
             logging.info(
-                f"Node {self.node_id} became Leader for term {self.state.persistant_state.current_term}"
+                f"elected Leader for term {self.state.persistant_state.current_term}"
             )
             self.state.leader_state = VolatileLeaderState(
                 next_index={
@@ -369,11 +509,15 @@ class RaftServer:
                 },
                 match_index={peer: 0 for peer in self.peers},
             )
-            self.send_heartbeats()
+            # TODO: Turn this back on!!
+            # self.send_heartbeats()
         else:
+            # election failed due to lack of majority (either because of split vote,
+            # or because of the election of another leader)
+            # TODO: make sure that we are acquiring the lock
             self.status = ServerStatus.Follower
             logging.info(
-                f"Node {self.node_id} failed to become Leader in term {self.state.persistant_state.current_term}"
+                f"failed to attain majority in term {self.state.persistant_state.current_term}"
             )
             self.reset_election_timeout()
 
@@ -440,78 +584,6 @@ class RaftServer:
                         logging.info(
                             f"Node {self.node_id} found higher term {resp['term']} from peer {peer_port}, reverting to Follower"
                         )
-
-    def handle_request_vote(self, msg: bytes) -> bytes:
-        """
-        Handles incoming RequestVote RPCs from candidates.
-
-        This method processes the vote request by comparing the candidate's term
-        and log with its own. If the candidate's log is at least as up-to-date
-        and the server hasn't voted for another candidate in the current term,
-        it grants the vote.
-
-        Args:
-            msg (bytes): The serialized JSON payload of the RequestVote RPC.
-
-        Returns:
-            bytes: The serialized JSON response indicating whether the vote was
-                   granted.
-        """
-        data = json.loads(msg.decode())
-        term = data["term"]
-        candidate_id = data["candidate_id"]
-        last_log_index = data["last_log_index"]
-        last_log_term = data["last_log_term"]
-
-        vote_granted = False
-
-        with self.lock:
-            if term < self.state.persistant_state.current_term:
-                vote_granted = False
-                logging.debug(
-                    f"Node {self.node_id} rejects vote for {candidate_id} in term {term} (current term {self.state.persistant_state.current_term})"
-                )
-            else:
-                if term > self.state.persistant_state.current_term:
-                    self.state.persistant_state.current_term = term
-                    self.state.persistant_state.voted_for = None
-                    self.status = ServerStatus.Follower
-                    logging.debug(
-                        f"Node {self.node_id} updates term to {term} and reverts to Follower"
-                    )
-                if (
-                    self.state.persistant_state.voted_for is None
-                    or self.state.persistant_state.voted_for == candidate_id
-                ):
-                    last_term = (
-                        self.state.persistant_state.log[-1]["term"]
-                        if self.state.persistant_state.log
-                        else 0
-                    )
-                    if (last_log_term > last_term) or (
-                        last_log_term == last_term
-                        and last_log_index >= len(self.state.persistant_state.log)
-                    ):
-                        self.state.persistant_state.voted_for = candidate_id
-                        vote_granted = True
-                        self.reset_election_timeout()
-                        logging.info(
-                            f"Node {self.node_id} grants vote to {candidate_id} for term {term}"
-                        )
-                    else:
-                        logging.info(
-                            f"Node {self.node_id} rejects vote to {candidate_id} due to log inconsistency"
-                        )
-                else:
-                    logging.info(
-                        f"Node {self.node_id} has already voted for {self.state.persistant_state.voted_for} in term {self.state.persistant_state.current_term}"
-                    )
-
-        response = {
-            "term": self.state.persistant_state.current_term,
-            "vote_granted": vote_granted,
-        }
-        return json.dumps(response).encode()
 
     def handle_append_entries(self, msg: bytes) -> bytes:
         """

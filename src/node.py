@@ -17,10 +17,12 @@ class NodeHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
         # Pass message to the appropriate handler
         response = node.handle_message(path, msg)
-        logging.info(f"Node {node.node_id} received at {path}: {msg}")
+        logging.debug(f"Node {node.node_id} received at {path}: {msg}")
+        logging.debug(f"Node response: {response}")
 
         self.send_response(204 if response is None else 200)
         self.end_headers()
+
         if response:
             self.wfile.write(response)
 
@@ -76,11 +78,12 @@ class Node(SingletonMixin):
         self.running = False
 
     def register_endpoint(self, endpoint: str, handler: Any):
+        logging.info(f"registering endpoint at {endpoint}!")
         self._endpoints[endpoint] = handler
 
     def handle_message(self, endpoint: str, msg: bytes) -> Optional[bytes]:
         # send message to correct function based on input
-        logging.info(f"Received message from endpoint {endpoint}: {msg}")
+        logging.debug(f"Received message from endpoint {endpoint}: {msg}")
         if endpoint not in self._endpoints:
             return None
         else:
@@ -96,14 +99,14 @@ class Node(SingletonMixin):
         # FIXME?: move it to the decorator?
         if random.random() < self.message_success_rate:
             url = f"http://localhost:{target}/{endpoint}"
-            logging.info(f"Sending message to {url} with contents: {msg}")
+            logging.debug(f"Sending message to {url} with contents: {msg}")
             try:
                 response = requests.post(url, data=msg)
-                logging.info(
+                logging.debug(
                     f"Received response with status code: {response.status_code}"
                 )
                 if response.status_code == 200:
-                    logging.info(f"Received content: {response.content}")
+                    logging.debug(f"Received content: {response.content}")
                     return response.content
                 else:
                     logging.error(f"Failed with status code: {response.status_code}")
