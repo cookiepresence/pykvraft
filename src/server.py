@@ -3,12 +3,10 @@ logging.basicConfig(level=logging.INFO)
 
 import argparse
 import raft_server
-
 import node
-import rpc
+import rpc  # MAKE SURE rpc is imported after raft_server is instantiated
 
-
-node = node.Node.instance()
+node_instance = node.Node.instance()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Start a Raft Node")
@@ -18,24 +16,26 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # set all required params
-    node.node_id = args.node_id
-    node.port = args.port
-    node.peers = args.peers
+    node_instance.node_id = args.node_id
+    node_instance.port = args.port
+    node_instance.peers = args.peers
 
-    # Start the node
-    node.start()
+    raft = raft_server.RaftServer(node_id=args.node_id, peers=args.peers)
+
+    node_instance.raft_server = raft
+
+    node_instance.start()
 
     try:
         while True:
-            print(f"Node {node.node_id}> ", end="")
+            print(f"Node {node_instance.node_id}> ", end="")
             command = input().strip()
             match command.split():
                 case ["send", target, "to", endpoint, *message]:
                     try:
                         target_port = int(target)
                         payload = " ".join(message).encode()
-                        response = node.send_message(target_port, endpoint, payload)
+                        response = node_instance.send_message(target_port, endpoint, payload)
                         if response:
                             print(f"Response from {target}:{endpoint}: {response.decode()}")
                         else:
@@ -43,12 +43,26 @@ if __name__ == "__main__":
                     except ValueError:
                         print(f"Invalid target port: {target}")
                 case ["stop"]:
-                    node.stop()
+                    node_instance.stop()
                     break
                 case ["hello", target, name, times]:
                     for _ in range(int(times)):
-                        raft_server.Hello(int(target), name)
+                        rpc.Hello(int(target), name)
+                case ["set", key, value]:
+                    if raft.client_set(key, value):
+                        print(f"SET {key} = {value} succeeded.")
+                    else:
+                        print("Failed to set key. Not the leader.")
+                case ["get", key]:
+                    value = raft.client_get(key)
+                    if value is not None:
+                        print(f"{key} = {value}")
+                    else:
+                        print(f"{key} not found.")
+                case ["make-leader"]:
+                    raft.force_leader()
+                    print("This node has been set as Leader.")
                 case _:
-                    print("Unknown command. Use 'send <target_port> to <endpoint> <message>' or 'stop'.")
+                    print("Unknown command. Use 'send <target_port> to <endpoint> <message>', 'stop', 'set <key> <value>', 'get <key>', or 'make-leader'.")
     except KeyboardInterrupt:
-        node.stop()
+        node_instance.stop()

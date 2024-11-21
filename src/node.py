@@ -5,7 +5,7 @@ import random
 import requests
 import http.server
 
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 
 
 class NodeHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -48,6 +48,8 @@ class Node(SingletonMixin):
 
     _endpoints: Dict = dataclasses.field(default_factory=dict)
 
+    raft_server: Optional[Any] = None  # Use Any to avoid direct import
+
     def start(self):
         if self.running:
             logging.info(f"Node {self.node_id} is already running.")
@@ -72,10 +74,10 @@ class Node(SingletonMixin):
         logging.info(f"Stopping node {self.node_id}.")
         self.running = False
 
-    def register_endpoint(self, endpoint, handler):
+    def register_endpoint(self, endpoint: str, handler: Any):
         self._endpoints[endpoint] = handler
 
-    def handle_message(self, endpoint: str, msg: bytes) -> Tuple[Optional[int], Optional[bytes]]:
+    def handle_message(self, endpoint: str, msg: bytes) -> Optional[bytes]:
         # send message to correct function based on input
         logging.info(f"Received message from endpoint {endpoint}: {msg}")
         if endpoint not in self._endpoints:
@@ -94,9 +96,9 @@ class Node(SingletonMixin):
             logging.info(f"Sending message to {url} with contents: {msg}")
             try:
                 response = requests.post(url, data=msg)
-                print(f"Response recieved: {response}")
+                logging.info(f"Received response with status code: {response.status_code}")
                 if response.status_code == 200:
-                    logging.info(f"Received success!: {response.content}")
+                    logging.info(f"Received content: {response.content}")
                     return response.content
                 else:
                     logging.error(f"Failed with status code: {response.status_code}")
