@@ -1,4 +1,5 @@
 import logging
+
 logging.basicConfig(level=logging.INFO)
 
 import argparse
@@ -10,7 +11,9 @@ node_instance = node.Node.instance()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Start a Raft Node")
-    parser.add_argument("--node-id", type=str, required=True, help="Node ID", dest="node_id")
+    parser.add_argument(
+        "--node-id", type=str, required=True, help="Node ID", dest="node_id"
+    )
     parser.add_argument("--port", type=int, required=True, help="Port to listen on")
     parser.add_argument("--peers", nargs="+", type=int, help="List of peer ports")
 
@@ -35,9 +38,13 @@ if __name__ == "__main__":
                     try:
                         target_port = int(target)
                         payload = " ".join(message).encode()
-                        response = node_instance.send_message(target_port, endpoint, payload)
+                        response = node_instance.send_message(
+                            target_port, endpoint, payload
+                        )
                         if response:
-                            print(f"Response from {target}:{endpoint}: {response.decode()}")
+                            print(
+                                f"Response from {target}:{endpoint}: {response.decode()}"
+                            )
                         else:
                             print(f"Failed to send message to {target}:{endpoint}.")
                     except ValueError:
@@ -63,6 +70,8 @@ if __name__ == "__main__":
                     raft.force_leader()
                     print("This node has been set as Leader.")
                 case _:
-                    print("Unknown command. Use 'send <target_port> to <endpoint> <message>', 'stop', 'set <key> <value>', 'get <key>', or 'make-leader'.")
+                    print(
+                        "Unknown command. Use 'send <target_port> to <endpoint> <message>', 'stop', 'set <key> <value>', 'get <key>', or 'make-leader'."
+                    )
     except KeyboardInterrupt:
         node_instance.stop()

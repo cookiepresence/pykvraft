@@ -2,7 +2,6 @@ import logging
 import functools
 import inspect
 import sys
-import concurrent.futures
 
 from typing import Any, NamedTuple, Optional
 from collections.abc import Callable
@@ -41,7 +40,7 @@ def rpc_call(func: Callable[..., Any]):
     Otherwise, there are little restrictions on what can an RPC do or not do.
     """
     # the endpoint of the function is the name of the function itself.
-    endpoint = func.__name__.replace('_', '-')
+    endpoint = func.__name__.replace("_", "-")
     logging.debug(f"Loading RPC call definition for {endpoint}")
 
     signature = inspect.signature(func)
@@ -61,9 +60,11 @@ def rpc_call(func: Callable[..., Any]):
         _ = getattr(sys.modules[__name__], argument_name)
 
         # Module found
-        logging.warning(f"Overwriting existing module at {argument_name}!"
-                        " This is highly dangerous, and it is recommended that one ensures that "
-                        "names do not conflict")
+        logging.warning(
+            f"Overwriting existing module at {argument_name}!"
+            " This is highly dangerous, and it is recommended that one ensures that "
+            "names do not conflict"
+        )
     except AttributeError:
         # Module not found, safe to add to sys modules
         pass
@@ -74,7 +75,9 @@ def rpc_call(func: Callable[..., Any]):
     # str, I think we are in greater trouble.
     return_annotation = signature.return_annotation or (Optional[str])
 
-    logging.debug(f"Initializing RPC Call: {endpoint}({arg_type}) -> {return_annotation}")
+    logging.debug(
+        f"Initializing RPC Call: {endpoint}({arg_type}) -> {return_annotation}"
+    )
 
     @functools.wraps(func)
     def wrapper_func(__port: Optional[int], *args, **kwargs):
@@ -90,19 +93,27 @@ def rpc_call(func: Callable[..., Any]):
 
         # Serialize it
         # TODO: Use specialized decoders
-        logging.debug(f"Encoding {func_params} to {getattr(argument_serde_type, 'name')}")
+        logging.debug(
+            f"Encoding {func_params} to {getattr(argument_serde_type, 'name')}"
+        )
         msg = msgpack_encode(list(func_params.values()), argument_serde_type)
 
         # Make the actual request
         assert __port in node.node.peers
 
         msg_content = node.node.send_message(target=__port, endpoint=endpoint, msg=msg)
-        return_vals = msgpack_decode(msg_content, return_annotation) if msg_content is not None else None
+        return_vals = (
+            msgpack_decode(msg_content, return_annotation)
+            if msg_content is not None
+            else None
+        )
         return return_vals
 
     def handler(msg: bytes) -> bytes:
         # Deserialize incoming message
-        logging.debug(f"Message to decode: {msg} -> {list(arg_type.items())} [{argument_serde_type}]")
+        logging.debug(
+            f"Message to decode: {msg} -> {list(arg_type.items())} [{argument_serde_type}]"
+        )
         args = msgpack_decode(msg, argument_serde_type)
         # Call function
         out = func(**args._asdict())
@@ -118,6 +129,7 @@ def rpc_call(func: Callable[..., Any]):
 @rpc_call
 def Hello(name: str) -> str:
     import time
+
     time.sleep(10)
     return f"Hello {name}!"
 

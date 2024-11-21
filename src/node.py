@@ -10,7 +10,7 @@ from typing import Optional, List, Dict, Tuple, Any
 
 class NodeHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
+        content_length = int(self.headers["Content-Length"])
         msg = self.rfile.read(content_length)
         path = self.path.lstrip("/")  # Get the endpoint name
         node = Node.instance()
@@ -40,7 +40,8 @@ class SingletonMixin(object):
 @dataclasses.dataclass
 class Node(SingletonMixin):
     """Represents a Raft node."""
-    node_id: str = ''
+
+    node_id: str = ""
     port: Optional[int] = None
     peers: List[int] = dataclasses.field(default_factory=list)
     running: bool = False
@@ -85,7 +86,9 @@ class Node(SingletonMixin):
         else:
             return self._endpoints[endpoint](msg)
 
-    def send_message(self, target: int, endpoint: str, msg: str | bytes) -> Optional[bytes]:
+    def send_message(
+        self, target: int, endpoint: str, msg: str | bytes
+    ) -> Optional[bytes]:
         if not self.running:
             return None
 
@@ -96,7 +99,9 @@ class Node(SingletonMixin):
             logging.info(f"Sending message to {url} with contents: {msg}")
             try:
                 response = requests.post(url, data=msg)
-                logging.info(f"Received response with status code: {response.status_code}")
+                logging.info(
+                    f"Received response with status code: {response.status_code}"
+                )
                 if response.status_code == 200:
                     logging.info(f"Received content: {response.content}")
                     return response.content
@@ -109,5 +114,6 @@ class Node(SingletonMixin):
         else:
             logging.info(f"Dropping message intended for {target} with contents: {msg}")
             return None
+
 
 node = Node.instance()
