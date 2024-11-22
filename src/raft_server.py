@@ -284,9 +284,7 @@ class RaftServer:
         Returns:
             float: The new election timeout timestamp.
         """
-        # TODO: Ideally, do not rely on the system clock. time.time() is not
-        # monotonic or precise
-        return time.time() + random.uniform(
+        return time.monotonic_ns() + random.uniform(
             self.min_election_timeout, self.max_election_timeout
         )
 
@@ -306,8 +304,7 @@ class RaftServer:
             # thread. The election thread can run independently, and only change states
             # by acquiring locks
             with self.lock:
-                # TODO: change to monotonic timers
-                if time.time() >= self.election_timeout:
+                if time.monotonic_ns() >= self.election_timeout:
                     self.start_election()
             time.sleep(0.05)
 
