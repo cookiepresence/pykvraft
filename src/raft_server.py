@@ -10,6 +10,7 @@ import concurrent.futures
 
 import rpc
 
+
 class ServerStatus(enum.Enum):
     """
     Represents the current state of a Raft server.
@@ -208,7 +209,13 @@ class RaftServer:
                                             leader.
     """
 
-    def __init__(self, node_id: str, peers: List[int], min_election_timeout=1.0, max_election_timeout=2.0):
+    def __init__(
+        self,
+        node_id: str,
+        peers: List[int],
+        min_election_timeout=1.0,
+        max_election_timeout=2.0,
+    ):
         """
         Initializes the RaftServer with the given node ID and peer ports.
 
@@ -279,7 +286,9 @@ class RaftServer:
         """
         # TODO: Ideally, do not rely on the system clock. time.time() is not
         # monotonic or precise
-        return time.time() + random.uniform(self.min_election_timeout, self.max_election_timeout)
+        return time.time() + random.uniform(
+            self.min_election_timeout, self.max_election_timeout
+        )
 
     def run_election_timer(self):
         """
@@ -316,7 +325,9 @@ class RaftServer:
                     self.send_heartbeats()
             time.sleep(self.heartbeat_interval)
 
-    def is_incoming_log_up_to_date(self, last_log_index: int, last_log_term: int) -> bool:
+    def is_incoming_log_up_to_date(
+        self, last_log_index: int, last_log_term: int
+    ) -> bool:
         """Checks if incoming log is atleast as up-to-date as the local log.
 
         [ref: Raft paper, section 5.4.1, pg 8]
@@ -354,8 +365,8 @@ class RaftServer:
             # If the logs end with the same term, then whichever log is longer
             # is more up-to-date.
             if (
-                    self_last_log_term == last_log_term and
-                    self_last_log_index <= last_log_index
+                self_last_log_term == last_log_term
+                and self_last_log_index <= last_log_index
             ):
                 logging.debug(
                     "incoming log is more up-to-date with more entries "
@@ -372,12 +383,14 @@ class RaftServer:
             return False
 
     @rpc.rpc_call(is_class_method=True)
-    def RequestVote(self, term: int, candidate_id: str, last_log_index: int, last_log_term: int) -> Tuple[int, bool]:
+    def RequestVote(
+        self, term: int, candidate_id: str, last_log_index: int, last_log_term: int
+    ) -> Tuple[int, bool]:
         with self.lock:
             current_term = self.state.persistant_state.current_term
             voted_for = self.state.persistant_state.voted_for
 
-            # (ง5.1) Reply false if term < current term
+            # (ยง5.1) Reply false if term < current term
             if term < current_term:
                 logging.debug(
                     f"Vote rejected for {candidate_id} in term {term} "
@@ -385,7 +398,7 @@ class RaftServer:
                 )
                 return (current_term, False)
 
-            # (ง5.1) [All servers] If RPC request or response contains
+            # (ยง5.1) [All servers] If RPC request or response contains
             # term T > currentTerm:
             # set currentTerm = T, convert to follower
             if term > current_term:
@@ -400,17 +413,18 @@ class RaftServer:
                 current_term = term
                 voted_for = None
 
-            # (ง5.2, ง5.4) If votedFor is null or candidateId,...
-            if (voted_for is not None and voted_for != candidate_id):
+            # (ยง5.2, ยง5.4) If votedFor is null or candidateId,...
+            if voted_for is not None and voted_for != candidate_id:
                 logging.info(
                     f"Vote rejected for {candidate_id} "
-                    f"(Already voted for {voted_for} in {current_term})")
+                    f"(Already voted for {voted_for} in {current_term})"
+                )
                 return (current_term, False)
             # ...and candidate's log is atleast as up-to-date as receiver's
             # log: grant vote
-            if ((voted_for is None
-                 or voted_for == candidate_id) and
-                self.is_incoming_log_up_to_date(last_log_index, last_log_term)):
+            if (
+                voted_for is None or voted_for == candidate_id
+            ) and self.is_incoming_log_up_to_date(last_log_index, last_log_term):
                 logging.info(f"Vote granted to {candidate_id}")
                 self.reset_election_timeout()
                 return (current_term, True)
@@ -420,7 +434,6 @@ class RaftServer:
                     f"(incoming log out of date wrt our own log)"
                 )
                 return (current_term, False)
-
 
     def start_election(self):
         """
@@ -456,23 +469,24 @@ class RaftServer:
         num_peers = len(self.peers)
         last_log_index = len(self.state.persistant_state.log)
         last_log_term = (
-            self.state.persistant_state.log[-1]["term"]
-            if last_log_index > 0
-            else 0
+            self.state.persistant_state.log[-1]["term"] if last_log_index > 0 else 0
         )
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            for peer, vote in zip(self.peers, executor.map(
+            for peer, vote in zip(
+                self.peers,
+                executor.map(
                     self.RequestVote,
                     self.peers,
                     [self.state.persistant_state.current_term] * num_peers,
                     [self.node_id] * num_peers,
                     [last_log_index] * num_peers,
-                    [last_log_term] * num_peers
-            )):
+                    [last_log_term] * num_peers,
+                ),
+            ):
                 if vote is not None:
                     (term, vote) = vote
-                    # (ง5.1) [All servers] If RPC request or response contains
+                    # (ยง5.1) [All servers] If RPC request or response contains
                     # term T > currentTerm:
                     # set currentTerm = T, convert to follower
                     if term > current_term:

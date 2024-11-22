@@ -66,7 +66,7 @@ def rpc_call(is_class_method=False):
         if is_class_method:
             # If it is a class method, we want to skip self while
             # serialisation, since that is not important to us
-            arg_type.pop('self', None)
+            arg_type.pop("self", None)
 
         argument_name = f"{function_name}_arguments"
         argument_serde_type = NamedTuple(argument_name, list(arg_type.items()))
@@ -112,7 +112,9 @@ def rpc_call(is_class_method=False):
             # respective arguments in order. Since the signature captures that exactly,
             # we can use that as is
             if is_class_method:
-                pos_params = {k: v for k, v in zip(list(signature.parameters.keys())[1:], args)}
+                pos_params = {
+                    k: v for k, v in zip(list(signature.parameters.keys())[1:], args)
+                }
             else:
                 pos_params = {k: v for k, v in zip(signature.parameters.keys(), args)}
             # Merge kwargs and pos_params to form the final dictionary
@@ -126,7 +128,9 @@ def rpc_call(is_class_method=False):
             # Make the actual request
             assert __port in node.node.peers
 
-            msg_content = node.node.send_message(target=__port, endpoint=endpoint, msg=msg)
+            msg_content = node.node.send_message(
+                target=__port, endpoint=endpoint, msg=msg
+            )
             return_vals = (
                 msgpack_decode(msg_content, return_annotation)
                 if msg_content is not None
@@ -150,19 +154,22 @@ def rpc_call(is_class_method=False):
             return msgpack_encode(out, return_annotation)
 
         if is_class_method:
+
             def bind_handler(instance):
                 # create a handler specific to the instance
                 def bound_handler(msg: bytes):
                     return handler(msg, obj=instance)
+
                 # register endpoint with the specific object
                 node.node.register_endpoint(endpoint, bound_handler)
 
-            setattr(func, 'rpc_bind_handler', bind_handler)
-            setattr(wrapper_func, 'rpc_bind_handler', bind_handler)
+            setattr(func, "rpc_bind_handler", bind_handler)
+            setattr(wrapper_func, "rpc_bind_handler", bind_handler)
         else:
             node.node.register_endpoint(endpoint, handler)
 
         return wrapper_func
+
     return decorator
 
 
