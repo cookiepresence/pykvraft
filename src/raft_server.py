@@ -253,17 +253,17 @@ class RaftServer:
 
         self.lock = threading.RLock()
 
+        # NOTE: might be more efficient on the GIL to use Events() or similar
+        #       so that we don't have threads doing unnecessary work
         self.election_timer = threading.Thread(
             target=self.run_election_timer, daemon=True
         )
         self.election_timer.start()
 
-        # TODO: Do not start the heartbeat thread whenever, it should
-        # be only when the leader is elected
-        # self.heartbeat_timer = threading.Thread(
-        #     target=self.run_heartbeat_timer, daemon=True
-        # )
-        # self.heartbeat_timer.start()
+        self.heartbeat_timer = threading.Thread(
+            target=self.run_heartbeat_timer, daemon=True
+        )
+        self.heartbeat_timer.start()
 
         # requrired for the RPC setup
         for attr_name in dir(self):
@@ -303,9 +303,19 @@ class RaftServer:
             # in the process. ideally, we would want the election to be on a separate
             # thread. The election thread can run independently, and only change states
             # by acquiring locks
-            with self.lock:
-                if time.monotonic_ns() >= self.election_timeout:
-                    self.start_election()
+            if (
+                    self.status == ServerStatus.Candidate or
+                    self.status == ServerStatus.Follower
+            ):
+                # double checking is safe in this context, since we are doing
+                # it at a regular interval.
+                with self.lock:
+                    if (
+                            self.status == ServerStatus.Candidate or
+                            self.status == ServerStatus.Follower
+                    ):
+                        if time.monotonic_ns() >= self.election_timeout:
+                            threading.Thread(thread=self.start_election, daemon=True).start()
             time.sleep(0.05)
 
     def run_heartbeat_timer(self):
@@ -317,9 +327,12 @@ class RaftServer:
         the defined heartbeat interval.
         """
         while self.running:
-            with self.lock:
-                if self.status == ServerStatus.Leader:
-                    self.send_heartbeats()
+            if self.status == ServerStatus.Leader:
+                # double checking is safe in this context, since we are doing
+                # it at a regular interval.
+                with self.lock:
+                    if self.status == ServerStatus.Leader:
+                        self.send_heartbeats()
             time.sleep(self.heartbeat_interval)
 
     def is_incoming_log_up_to_date(
@@ -432,6 +445,53 @@ class RaftServer:
                 )
                 return (current_term, False)
 
+    def become_follower(self, term: int) -> None:
+        """
+        Convert current server to Follower (while performing the required checks)
+
+        Args:
+            term (int): term of incoming request
+        """
+        with self.lock:
+            # stale term, can skip over
+            if self.persistant_state.current_term > term:
+                return None
+            # need to update current term
+            if self.persistant_state.current_term < term:
+                self.persistant_state.current_term = term
+
+            self.status = ServerStatus.Follower
+            self.state.persistant_state.voted_for = None
+            self.election_timeout = self.reset_election_timeout()
+
+    def become_leader(self, term: int) -> None:
+        """
+        Convert current server to Leader (while perfoming require checks)
+
+        Args:
+            term (int): term of incoming request
+        """
+        with self.lock:
+            # stale term, can skip
+            if self.persistant_state.current_term > term:
+                return None
+            # need to update current term from backlog
+            if self.persistant_state.current_term < term:
+                self.persistant_state.current_term = term
+
+            self.status = ServerStatus.Leader
+            self.leader_id = self.node_id
+            logging.info(
+                f"elected Leader for term {term}"
+            )
+            self.state.leader_state = VolatileLeaderState(
+                next_index={
+                    peer: len(self.state.persistant_state.log) + 1
+                    for peer in self.peers
+                },
+                match_index={peer: 0 for peer in self.peers},
+            )
+
     def start_election(self):
         """
         Initiates a new election by transitioning the server to the Candidate
@@ -443,31 +503,35 @@ class RaftServer:
 
         ref: Raft paper, Section 5.2, pg 5
         """
-        #  If a follower receives no communication over a period of time
-        # called the election timeout, then it assumes there is no vi-
-        # able leader and begins an election to choose a new leader.
-        self.reset_election_timeout()
+        with self.lock:
+            #  If a follower receives no communication over a period of time
+            # called the election timeout, then it assumes there is no vi-
+            # able leader and begins an election to choose a new leader.
+            self.election_timer = self.reset_election_timeout()
 
-        # To begin an election, a follower increments its current term...
-        self.state.persistant_state.current_term += 1
-        current_term = self.state.persistant_state.current_term
-        # ...and transitions to candidate state
-        self.status = ServerStatus.Candidate
-        # It then votes for itself...
-        self.state.persistant_state.voted_for = self.node_id
-        # note: implicit vote counted for self.
-        votes_granted = 0
+            # To begin an election, a follower increments its current term...
+            self.state.persistant_state.current_term += 1
+            current_term = self.state.persistant_state.current_term
+            # ...and transitions to candidate state
+            self.status = ServerStatus.Candidate
+            # It then votes for itself...
+            self.state.persistant_state.voted_for = self.node_id
+            # note: implicit vote counted for self.
+            votes_granted = 0
 
-        logging.info(
-            f"Node {self.node_id} is now a Candidate for term "
-            f"{self.state.persistant_state.current_term}"
-        )
+            logging.info(
+                f"Node {self.node_id} is now a Candidate for term "
+                f"{self.state.persistant_state.current_term}"
+            )
 
-        num_peers = len(self.peers)
-        last_log_index = len(self.state.persistant_state.log)
-        last_log_term = (
-            self.state.persistant_state.log[-1]["term"] if last_log_index > 0 else 0
-        )
+            num_peers = len(self.peers)
+            last_log_index = len(self.state.persistant_state.log)
+            last_log_term = (
+                self.state.persistant_state.log[-1]["term"]
+                if last_log_index > 0
+                else 0
+            )
+            self.send_heartbeats()
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             for peer, vote in zip(
@@ -487,13 +551,13 @@ class RaftServer:
                     # term T > currentTerm:
                     # set currentTerm = T, convert to follower
                     if term > current_term:
-                        # TODO: Check if the state has not drifted [acquire lock]...
-                        self.status = ServerStatus.Follower
+                        self.become_follower(current_term)
                         logging.debug(
                             f"breaking out of the election and returning to Follower "
                             f"(received {term},"
-                            f" greater than {self.state.persistant_state.current_term})"
+                            f" greater than {current_term})"
                         )
+                        break
                     logging.info(f"vote recieved from {peer}")
                     votes_granted += 1 if vote else 0
                     # If at any point we have enough votes for a majority, we
@@ -507,30 +571,14 @@ class RaftServer:
         # A candidate wins an election if it receives votes from
         # a majority of the servers in the full cluster for the same term
         if votes_granted > len(self.peers) // 2:
-            # TODO: acquire lock!
-            self.status = ServerStatus.Leader
-            self.leader_id = self.node_id
-            logging.info(
-                f"elected Leader for term {self.state.persistant_state.current_term}"
-            )
-            self.state.leader_state = VolatileLeaderState(
-                next_index={
-                    peer: len(self.state.persistant_state.log) + 1
-                    for peer in self.peers
-                },
-                match_index={peer: 0 for peer in self.peers},
-            )
-            # TODO: Turn this back on!!
-            # self.send_heartbeats()
+            self.become_leader(current_term)
         else:
             # election failed due to lack of majority (either because of split vote,
             # or because of the election of another leader)
-            # TODO: make sure that we are acquiring the lock
-            self.status = ServerStatus.Follower
             logging.info(
-                f"failed to attain majority in term {self.state.persistant_state.current_term}"
+                f"failed to attain majority in term {current_term}"
             )
-            self.reset_election_timeout()
+            self.become_follower(current_term)
 
     def send_heartbeats(self):
         """
