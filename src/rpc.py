@@ -171,7 +171,6 @@ def rpc_call(is_class_method=False):
 
     return decorator
 
-
 @rpc_call()
 def Hello(name: str) -> str:
     import time

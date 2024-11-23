@@ -10,7 +10,6 @@ import concurrent.futures
 
 import rpc
 
-
 class ServerStatus(enum.Enum):
     """
     Represents the current state of a Raft server.
@@ -213,8 +212,8 @@ class RaftServer:
         self,
         node_id: str,
         peers: List[int],
-        min_election_timeout=1.0,
-        max_election_timeout=2.0,
+        min_election_timeout: float = 1000.0,
+        max_election_timeout: float = 2000.0,
     ):
         """
         Initializes the RaftServer with the given node ID and peer ports.
@@ -248,6 +247,7 @@ class RaftServer:
         self.max_election_timeout = max_election_timeout
 
         self.leader_id: Optional[str] = None
+        self.election_timeout: float = 0.0
         self.election_timeout: float = self.reset_election_timeout()
         self.heartbeat_interval: float = 0.1
 
@@ -284,9 +284,14 @@ class RaftServer:
         Returns:
             float: The new election timeout timestamp.
         """
+        logging.debug(f"current election timeout: {self.election_timeout}")
+        logging.debug(f"current time: {time.monotonic_ns()}")
+        logging.debug(f"new election timeout: {time.monotonic_ns() + random.uniform(
+            self.min_election_timeout, self.max_election_timeout
+        ) * 1e6}")
         return time.monotonic_ns() + random.uniform(
             self.min_election_timeout, self.max_election_timeout
-        )
+        ) * 1e6
 
     def run_election_timer(self):
         """
