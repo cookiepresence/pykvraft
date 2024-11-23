@@ -315,7 +315,7 @@ class RaftServer:
                             self.status == ServerStatus.Follower
                     ):
                         if time.monotonic_ns() >= self.election_timeout:
-                            threading.Thread(thread=self.start_election, daemon=True).start()
+                            threading.Thread(target=self.start_election, daemon=True).start()
             time.sleep(0.05)
 
     def run_heartbeat_timer(self):
@@ -454,11 +454,11 @@ class RaftServer:
         """
         with self.lock:
             # stale term, can skip over
-            if self.persistant_state.current_term > term:
+            if self.state.persistant_state.current_term > term:
                 return None
             # need to update current term
-            if self.persistant_state.current_term < term:
-                self.persistant_state.current_term = term
+            if self.state.persistant_state.current_term < term:
+                self.state.persistant_state.current_term = term
 
             self.status = ServerStatus.Follower
             self.state.persistant_state.voted_for = None
@@ -473,11 +473,11 @@ class RaftServer:
         """
         with self.lock:
             # stale term, can skip
-            if self.persistant_state.current_term > term:
+            if self.state.persistant_state.current_term > term:
                 return None
             # need to update current term from backlog
-            if self.persistant_state.current_term < term:
-                self.persistant_state.current_term = term
+            if self.state.persistant_state.current_term < term:
+                self.state.persistant_state.current_term = term
 
             self.status = ServerStatus.Leader
             self.leader_id = self.node_id
@@ -531,7 +531,6 @@ class RaftServer:
                 if last_log_index > 0
                 else 0
             )
-            self.send_heartbeats()
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             for peer, vote in zip(
@@ -589,8 +588,44 @@ class RaftServer:
         threads to send heartbeats concurrently to each peer.
         """
         logging.debug(f"Node {self.node_id} sending heartbeats to peers")
-        for peer in self.peers:
-            threading.Thread(target=self.send_append_entries, args=(peer,)).start()
+
+        with self.lock:
+            current_term = self.state.persistant_state.current_term
+            peers = self.peers
+            num_peers = len(peers)
+            node_id = self.node_id
+            prev_log_index = len(self.state.persistant_state.log)
+            prev_log_term = self.state.persistant_state.log[-1]["term"] if prev_log_index > 0 else 0
+            leader_commit = self.state.commit_index
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            for peer, response in zip(
+                self.peers,
+                executor.map(
+                    self.AppendEntries,
+                    peers,
+                    [current_term] * num_peers,
+                    [node_id] * num_peers,
+                    [prev_log_index] * num_peers,
+                    [prev_log_term] * num_peers,
+                    [[]] * num_peers,  # heartbeat does NOT require any entries
+                    [leader_commit] * num_peers,
+                ),
+            ):
+                # something failed midway, can skip
+                if response is None:
+                    continue
+                term, success = response
+                if term > current_term:
+                    logging.info(
+                        f"received higher term {term} in heartbeat, retiring..."
+                    )
+                    self.become_follower(term)
+                if success:
+                    with self.lock:
+                        self.state.leader_state.match_index[peer] = prev_log_index
+                        self.state.leader_state.next_index[peer] = prev_log_index + 1
+                        logging.info(f"successfully replicated to perr {peer}")
 
     def send_append_entries(self, peer_port):
         """
@@ -644,92 +679,76 @@ class RaftServer:
                             f"Node {self.node_id} found higher term {resp['term']} from peer {peer_port}, reverting to Follower"
                         )
 
-    def handle_append_entries(self, msg: bytes) -> bytes:
-        """
-        Handles incoming AppendEntries RPCs from the leader.
-
-        This method processes the AppendEntries RPC by verifying the leader's
-        term and ensuring log consistency. If the entries are valid, it appends
-        them to the local log and updates the commit index accordingly.
-
-        Args:
-            msg (bytes): The serialized JSON payload of the AppendEntries RPC.
-
-        Returns:
-            bytes: The serialized JSON response indicating whether the append
-                   was successful.
-        """
-        data = json.loads(msg.decode())
-        term = data["term"]
-        leader_id = data["leader_id"]
-        prev_log_index = data["prev_log_index"]
-        prev_log_term = data["prev_log_term"]
-        entries = data["entries"]
-        leader_commit = data["leader_commit"]
-
-        success = False
-
+    @rpc.rpc_call(is_class_method=True)
+    def AppendEntries(self, term: int, leader_id: str, prev_log_index: int, prev_log_term: int, entries: List[Dict[str, Any]], leader_commit: int) -> Tuple[int, bool]:
         with self.lock:
+            # 1. (§5.1) Reply false if term < currentTerm
             if term < self.state.persistant_state.current_term:
-                success = False
-                logging.debug(
-                    f"Node {self.node_id} rejects AppendEntries from {leader_id} for term {term} (current term {self.state.persistant_state.current_term})"
+                logging.info(
+                    "failed to append entries to log; term out of date "
+                    f"({term} received vs {self.state.persistant_state.current_term})"
                 )
-            else:
-                if term > self.state.persistant_state.current_term:
-                    self.state.persistant_state.current_term = term
-                    self.state.persistant_state.voted_for = None
-                self.leader_id = leader_id
-                self.status = ServerStatus.Follower
-                self.reset_election_timeout()
-                logging.debug(
-                    f"Node {self.node_id} received AppendEntries from Leader {leader_id} for term {term}"
+                return (self.state.persistant_state.current_term, False)
+
+            # If RPC request or response contains term T > currentTerm:
+            # set currentTerm = T, convert to follower
+            # In the current case: already Follower
+            if term > self.state.persistant_state.current_term:
+                self.state.persistant_state.current_term = term
+                self.state.persistant_state.voted_for = None
+
+            self.leader_id = leader_id
+            self.election_timeout = self.reset_election_timeout()
+
+            # 2. (§5.3) Reply false if log doesn’t contain an entry at prevLogIndex
+            # whose term matches prevLogTerm
+            if prev_log_index > 0 and (
+                    len(self.state.persistant_state.log) < prev_log_index or
+                    self.state.persistant_state.log[prev_log_index - 1]["term"]
+                    != prev_log_term
+            ):
+                logging.info(
+                    "failed to append entires to log; log out of date "
+                    f"[log index: {len(self.state.persistant_state.log)} vs {prev_log_index}] "
+                    f"[log terms: {self.state.persistant_state.log[prev_log_index - 1]['term']} vs {prev_log_term}"
                 )
+                return (self.state.persistant_state.current_term, False)
 
-                if prev_log_index == 0 or (
-                    len(self.state.persistant_state.log) >= prev_log_index
-                    and self.state.persistant_state.log[prev_log_index - 1]["term"]
-                    == prev_log_term
-                ):
-                    success = True
-                    for entry in entries:
-                        index = entry["index"]
-                        if len(self.state.persistant_state.log) >= index:
-                            if (
-                                self.state.persistant_state.log[index - 1]["term"]
-                                != entry["term"]
-                            ):
-                                self.state.persistant_state.log = (
-                                    self.state.persistant_state.log[: index - 1]
-                                )
-                                logging.info(
-                                    f"Node {self.node_id} deletes conflicting log entries starting at index {index}"
-                                )
-                                break
-                        else:
-                            break
-                    for entry in entries:
-                        index = entry["index"]
-                        if len(self.state.persistant_state.log) < index:
-                            self.state.persistant_state.log.append(entry)
-                            logging.info(
-                                f"Node {self.node_id} appends new entry {entry} at index {index}"
-                            )
+            # success: true if follower contained entry matching
+            #          prevLogIndex and prevLogTerm
+            results = (self.state.persistant_state.current_term, True)
 
-                    if leader_commit > self.state.commit_index:
-                        self.state.commit_index = min(
-                            leader_commit, len(self.state.persistant_state.log)
-                        )
-                        self.apply_committed_entries()
-                        logging.info(
-                            f"Node {self.node_id} updates commit_index to {self.state.commit_index}"
-                        )
+            # 3. (§5.3) If an existing entry conflicts with a new one (same index
+            # but different terms), delete the existing entry and all that
+            # follow it
+            # NOTE: Assuming that the index and term are monotonically increasing
+            for entry in entries:
+                index = entry["index"]
+                if len(self.state.persistant_state.log) <= index:
+                    break
+                if self.state.persistant_state.log[index - 1]["term"] != entry["term"]:
+                    self.state.persistant_state.log = self.state.persistant_state.log[:index - 1]
+                    logging.info(
+                        f"deleting conflicting entries starting from index {index}"
+                    )
+                    break
 
-        response = {
-            "term": self.state.persistant_state.current_term,
-            "success": success,
-        }
-        return json.dumps(response).encode()
+            # 4. Append any new entries not already in the log
+            for entry in entries:
+                index = entry["index"]
+                if len(self.state.persistant_state.log) < index:
+                    self.state.persistant_state.log.append(entry)
+                    logging.info(
+                        f"appending new entry at index {index}"
+                    )
+
+            # If leaderCommit > commitIndex, set commitIndex =
+            # min(leaderCommit, index of last new entry)
+            if leader_commit > self.state.commit_index:
+                self.state.commit_index = min(leader_commit, len(self.state.persistant_state.log))
+                logging.info(f"updating commit index to {self.state.commit_index}")
+
+        return results
 
     def apply_committed_entries(self):
         """

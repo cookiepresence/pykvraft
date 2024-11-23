@@ -13,7 +13,6 @@ from mashumaro.codecs.msgpack import msgpack_decode, msgpack_encode
 
 import node  # ONLY AFTER import node, not raft_server
 
-
 def rpc_call(is_class_method=False):
     """
     This is a decorator that can automatically register rpc calls and handle

@@ -1,7 +1,5 @@
 import logging
 
-logging.basicConfig(level=logging.INFO)
-
 import argparse
 import raft_server
 import node
@@ -18,6 +16,8 @@ if __name__ == "__main__":
     parser.add_argument("--peers", nargs="+", type=int, help="List of peer ports")
 
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format=f'[{args.node_id} | %(asctime)s] %(levelname)3s %(message)s', force=True)
 
     node_instance.node_id = args.node_id
     node_instance.port = args.port
