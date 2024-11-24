@@ -465,6 +465,7 @@ class RaftServer:
             if self.state.persistent_state.current_term < term:
                 self.state.persistent_state.current_term = term
 
+            logging.info(f"reverting back to follower for term {term}")
             self.status = ServerStatus.Follower
             self.state.persistent_state.voted_for = None
             self.election_timeout = self.reset_election_timeout()
@@ -478,12 +479,10 @@ class RaftServer:
         """
         with self.lock:
             # stale term, can skip
-            if self.state.persistent_state.current_term > term:
+            if self.state.persistent_state.current_term != term:
                 return None
-            # need to update current term from backlog
-            if self.state.persistent_state.current_term < term:
-                self.state.persistent_state.current_term = term
 
+            logging.info(f"elected leader for term {term}")
             self.status = ServerStatus.Leader
             self.leader_id = self.node_id
             logging.info(
@@ -599,8 +598,17 @@ class RaftServer:
             peers = self.peers
             num_peers = len(peers)
             node_id = self.node_id
-            prev_log_index = len(self.state.persistent_state.log)
-            prev_log_term = self.state.persistent_state.log[-1]["term"] if prev_log_index > 0 else 0
+            prev_log_index = self.state.leader_state.next_index
+            logging.info(f"{prev_log_index=}")
+            logging.info(f"{self.state.persistent_state.log[0] if self.state.persistent_state.log else []}")
+            prev_log_term = map(
+                lambda idx: self.state.persistent_state.log[idx - 1]["term"],
+                prev_log_index.values()
+            ) if self.state.persistent_state.log else [0] * len(peers)
+            entries = [
+                self.state.persistent_state.log[idx - 1:]
+                for idx in prev_log_index.values()
+            ]
             leader_commit = self.state.commit_index
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -611,9 +619,9 @@ class RaftServer:
                     peers,
                     [current_term] * num_peers,
                     [node_id] * num_peers,
-                    [prev_log_index] * num_peers,
-                    [prev_log_term] * num_peers,
-                    [[]] * num_peers,  # heartbeat does NOT require any entries
+                    prev_log_index.values(),
+                    prev_log_term,
+                    entries,  # heartbeat does NOT require any entries
                     [leader_commit] * num_peers,
                 ),
             ):
@@ -628,61 +636,13 @@ class RaftServer:
                     self.become_follower(term)
                 if success:
                     with self.lock:
-                        self.state.leader_state.match_index[peer] = prev_log_index
-                        self.state.leader_state.next_index[peer] = prev_log_index + 1
+                        self.state.leader_state.match_index[peer] = prev_log_index[peer]
+                        self.state.leader_state.next_index[peer] = prev_log_index[peer] + 1
                         logging.info(f"successfully replicated to perr {peer}")
-
-    def send_append_entries(self, peer_port):
-        """
-        Sends an AppendEntries RPC to a specified follower to replicate the
-        leader's log.
-
-        This method constructs the payload for the AppendEntries RPC, including
-        the current term, leader ID, previous log index and term, any new
-        entries, and the leader's commit index. It then sends the RPC to the
-        designated peer and processes the response.
-
-        Args:
-            peer_port (int): The port number of the follower to send the
-                             AppendEntries RPC to.
-        """
-        if self.status != ServerStatus.Leader:
-            return
-        prev_log_index = self.state.leader_state.next_index.get(peer_port, 1) - 1
-        prev_log_term = (
-            self.state.persistent_state.log[prev_log_index - 1]["term"]
-            if prev_log_index > 0
-            else 0
-        )
-        entries = []
-        payload = {
-            "term": self.state.persistent_state.current_term,
-            "leader_id": self.node_id,
-            "prev_log_index": prev_log_index,
-            "prev_log_term": prev_log_term,
-            "entries": entries,
-            "leader_commit": self.state.commit_index,
-        }
-        response = self.node.send_message(
-            peer_port, "AppendEntries", json.dumps(payload).encode()
-        )
-        if response:
-            resp = json.loads(response.decode())
-            if resp.get("success"):
-                self.state.leader_state.match_index[peer_port] = prev_log_index
-                self.state.leader_state.next_index[peer_port] = prev_log_index + 1
-                logging.info(
-                    f"Node {self.node_id} successfully replicated to peer {peer_port}"
-                )
-            else:
-                if resp.get("term", 0) > self.state.persistent_state.current_term:
+                else:
                     with self.lock:
-                        self.state.persistent_state.current_term = resp["term"]
-                        self.status = ServerStatus.Follower
-                        self.state.persistent_state.voted_for = None
-                        logging.info(
-                            f"Node {self.node_id} found higher term {resp['term']} from peer {peer_port}, reverting to Follower"
-                        )
+                        self.state.leader_state.next_index[peer] = max(min(self.state.leader_state.next_index[peer], prev_log_index[peer] - 1), 1)
+            self.apply_committed_entries()
 
     @rpc.rpc_call(is_class_method=True)
     def AppendEntries(self, term: int, leader_id: str, prev_log_index: int, prev_log_term: int, entries: List[Dict[str, Any]], leader_commit: int) -> Tuple[int, bool]:
@@ -712,10 +672,11 @@ class RaftServer:
                     self.state.persistent_state.log[prev_log_index - 1]["term"]
                     != prev_log_term
             ):
+                print(self.state.persistent_state.log)
                 logging.info(
                     "failed to append entires to log; log out of date "
                     f"[log index: {len(self.state.persistent_state.log)} vs {prev_log_index}] "
-                    f"[log terms: {self.state.persistent_state.log[prev_log_index - 1]['term']} vs {prev_log_term}"
+                    # f"[log terms: {self.state.persistent_state.log[prev_log_index - 1]['term']} vs {prev_log_term}"
                 )
                 return (self.state.persistent_state.current_term, False)
 
@@ -811,104 +772,12 @@ class RaftServer:
             logging.info(
                 f"Node {self.node_id} appended SET command to log: {new_entry}"
             )
-            self.state.commit_index += 1
-            logging.info(
-                f"Node {self.node_id} updates commit_index to {self.state.commit_index}"
-            )
-            self.apply_committed_entries()
-            self.replicate_log_entry(new_entry)
+            # self.state.commit_index += 1
+            # logging.info(
+            #     f"Node {self.node_id} updates commit_index to {self.state.commit_index}"
+            # )
+            self.send_heartbeats()
             return True
-
-    def replicate_log_entry(self, entry: Dict[str, Any]):
-        """
-        Initiates the replication of a single log entry to all followers.
-
-        This method spawns separate threads to concurrently send the log entry
-        to each peer.
-
-        Args:
-            entry (Dict[str, Any]): The log entry to replicate.
-        """
-        for peer in self.peers:
-            threading.Thread(
-                target=self.send_append_entries_with_entry,
-                args=(peer, entry),
-                daemon=True,
-            ).start()
-
-    def send_append_entries_with_entry(self, peer_port: int, entry: Dict[str, Any]):
-        """
-        Sends an AppendEntries RPC containing a specific log entry to a
-        designated follower.
-
-        This method constructs the AppendEntries payload with the new entry and
-        sends it to the follower. It then processes the response to update
-        replication indices or handle term discrepancies.
-
-        Args:
-            peer_port (int): The port number of the follower to send the
-                             AppendEntries RPC to.
-            entry (Dict[str, Any]): The log entry to include in the
-                                    AppendEntries RPC.
-        """
-        with self.lock:
-            prev_log_index = entry["index"] - 1
-            prev_log_term = (
-                self.state.persistent_state.log[prev_log_index - 1]["term"]
-                if prev_log_index > 0
-                else 0
-            )
-            payload = {
-                "term": self.state.persistent_state.current_term,
-                "leader_id": self.node_id,
-                "prev_log_index": prev_log_index,
-                "prev_log_term": prev_log_term,
-                "entries": [entry],
-                "leader_commit": self.state.commit_index,
-            }
-        response = self.node.send_message(
-            peer_port, "AppendEntries", json.dumps(payload).encode()
-        )
-        if response:
-            resp = json.loads(response.decode())
-            if resp.get("success"):
-                with self.lock:
-                    self.state.leader_state.match_index[peer_port] = entry["index"]
-                    self.state.leader_state.next_index[peer_port] = entry["index"] + 1
-                logging.info(
-                    f"Node {self.node_id} successfully replicated to peer {peer_port}"
-                )
-            else:
-                if resp.get("term", 0) > self.state.persistent_state.current_term:
-                    with self.lock:
-                        self.state.persistent_state.current_term = resp["term"]
-                        self.status = ServerStatus.Follower
-                        self.state.persistent_state.voted_for = None
-                        logging.info(
-                            f"Node {self.node_id} found higher term {resp['term']} from peer {peer_port}, reverting to Follower"
-                        )
-        else:
-            logging.error(f"Failed to replicate to peer {peer_port}")
-
-    def client_get(self, key: str) -> Optional[str]:
-        """
-        Handles client requests to retrieve the value associated with a given
-        key.
-
-        This method accesses the key-value store to fetch the value and logs
-        the operation.
-
-        Args:
-            key (str): The key whose value is to be retrieved.
-
-        Returns:
-            Optional[str]: The value associated with the key, or None if the
-                           key does not exist.
-        """
-        kv_store = KeyValueStore.instance()
-        value = kv_store.get(key)
-        logging.info(f"Node {self.node_id} retrieved key '{key}' with value '{value}'")
-        return value
 
     def force_leader(self):
         """
