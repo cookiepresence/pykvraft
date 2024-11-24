@@ -10,6 +10,7 @@ import concurrent.futures
 
 import rpc
 
+
 class ServerStatus(enum.Enum):
     """
     Represents the current state of a Raft server.
@@ -53,7 +54,9 @@ class PersistentServerState:
 
     current_term: int = 0
     voted_for: Optional[str] = None
-    log: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+    log: List[Dict[str, Any]] = dataclasses.field(
+        default_factory=lambda: [{"term": 0, "index": 0, "command": None}]
+    )
 
 
 @dataclasses.dataclass
@@ -286,12 +289,15 @@ class RaftServer:
         """
         logging.debug(f"current election timeout: {self.election_timeout}")
         logging.debug(f"current time: {time.monotonic_ns()}")
-        logging.debug(f"new election timeout: {time.monotonic_ns() + random.uniform(
+        logging.debug(
+            f"new election timeout: {time.monotonic_ns() + random.uniform(
             self.min_election_timeout, self.max_election_timeout
-        ) * 1e6}")
-        return time.monotonic_ns() + random.uniform(
-            self.min_election_timeout, self.max_election_timeout
-        ) * 1e6
+        ) * 1e6}"
+        )
+        return (
+            time.monotonic_ns()
+            + random.uniform(self.min_election_timeout, self.max_election_timeout) * 1e6
+        )
 
     def run_election_timer(self):
         """
@@ -309,18 +315,20 @@ class RaftServer:
             # thread. The election thread can run independently, and only change states
             # by acquiring locks
             if (
-                    self.status == ServerStatus.Candidate or
-                    self.status == ServerStatus.Follower
+                self.status == ServerStatus.Candidate
+                or self.status == ServerStatus.Follower
             ):
                 # double checking is safe in this context, since we are doing
                 # it at a regular interval.
                 with self.lock:
                     if (
-                            self.status == ServerStatus.Candidate or
-                            self.status == ServerStatus.Follower
+                        self.status == ServerStatus.Candidate
+                        or self.status == ServerStatus.Follower
                     ):
                         if time.monotonic_ns() >= self.election_timeout:
-                            threading.Thread(target=self.start_election, daemon=True).start()
+                            threading.Thread(
+                                target=self.start_election, daemon=True
+                            ).start()
             time.sleep(0.05)
 
     def run_heartbeat_timer(self):
@@ -359,16 +367,8 @@ class RaftServer:
                                    incoming node.
         """
         with self.lock:
-            self_last_log_term = (
-                self.state.persistent_state.log[-1]["term"]
-                if self.state.persistent_state.log
-                else 0
-            )
-            self_last_log_index = (
-                len(self.state.persistent_state.log)
-                if self.state.persistent_state.log
-                else 0
-            )
+            self_last_log_term = self.state.persistent_state.log[-1]["term"]
+            self_last_log_index = len(self.state.persistent_state.log)
             # If the logs have last entries with different terms, then
             # the log with the later term is more up-to-date.
             if self_last_log_term < last_log_term:
@@ -417,7 +417,7 @@ class RaftServer:
             # term T > currentTerm:
             # set currentTerm = T, convert to follower
             if term > current_term:
-                logging.debug(
+                logging.info(
                     "Updating"
                     f" term {current_term} -> {term};"
                     f" state {self.status} -> {ServerStatus.Follower}"
@@ -485,13 +485,10 @@ class RaftServer:
             logging.info(f"elected leader for term {term}")
             self.status = ServerStatus.Leader
             self.leader_id = self.node_id
-            logging.info(
-                f"elected Leader for term {term}"
-            )
+            logging.info(f"elected Leader for term {term}")
             self.state.leader_state = VolatileLeaderState(
                 next_index={
-                    peer: len(self.state.persistent_state.log) + 1
-                    for peer in self.peers
+                    peer: len(self.state.persistent_state.log) for peer in self.peers
                 },
                 match_index={peer: 0 for peer in self.peers},
             )
@@ -530,11 +527,7 @@ class RaftServer:
 
             num_peers = len(self.peers)
             last_log_index = len(self.state.persistent_state.log)
-            last_log_term = (
-                self.state.persistent_state.log[-1]["term"]
-                if last_log_index > 0
-                else 0
-            )
+            last_log_term = self.state.persistent_state.log[-1]["term"]
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             for peer, vote in zip(
@@ -578,9 +571,7 @@ class RaftServer:
         else:
             # election failed due to lack of majority (either because of split vote,
             # or because of the election of another leader)
-            logging.info(
-                f"failed to attain majority in term {current_term}"
-            )
+            logging.info(f"failed to attain majority in term {current_term}")
             self.become_follower(current_term)
 
     def send_heartbeats(self):
@@ -600,20 +591,20 @@ class RaftServer:
             node_id = self.node_id
             prev_log_index = self.state.leader_state.next_index
             logging.info(f"{prev_log_index=}")
-            logging.info(f"{self.state.persistent_state.log[0] if self.state.persistent_state.log else []}")
-            prev_log_term = map(
-                lambda idx: self.state.persistent_state.log[idx - 1]["term"],
-                prev_log_index.values()
-            ) if self.state.persistent_state.log else [0] * len(peers)
-            entries = [
-                self.state.persistent_state.log[idx - 1:]
+            prev_log_term = [
+                self.state.persistent_state.log[idx - 1]["term"]
                 for idx in prev_log_index.values()
             ]
+            entries = [
+                self.state.persistent_state.log[idx:] for idx in prev_log_index.values()
+            ]
+            logging.info(f"{entries=}")
             leader_commit = self.state.commit_index
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            for peer, response in zip(
+            for peer, entry, response in zip(
                 self.peers,
+                entries,
                 executor.map(
                     self.AppendEntries,
                     peers,
@@ -637,15 +628,31 @@ class RaftServer:
                 if success:
                     with self.lock:
                         self.state.leader_state.match_index[peer] = prev_log_index[peer]
-                        self.state.leader_state.next_index[peer] = prev_log_index[peer] + 1
-                        logging.info(f"successfully replicated to perr {peer}")
+                        self.state.leader_state.next_index[peer] = prev_log_index[
+                            peer
+                        ] + len(entry)
+                        logging.info(f"successfully replicated to peer {peer}")
                 else:
                     with self.lock:
-                        self.state.leader_state.next_index[peer] = max(min(self.state.leader_state.next_index[peer], prev_log_index[peer] - 1), 1)
+                        self.state.leader_state.next_index[peer] = max(
+                            min(
+                                self.state.leader_state.next_index[peer],
+                                prev_log_index[peer] - 1,
+                            ),
+                            0,
+                        )
             self.apply_committed_entries()
 
     @rpc.rpc_call(is_class_method=True)
-    def AppendEntries(self, term: int, leader_id: str, prev_log_index: int, prev_log_term: int, entries: List[Dict[str, Any]], leader_commit: int) -> Tuple[int, bool]:
+    def AppendEntries(
+        self,
+        term: int,
+        leader_id: str,
+        prev_log_index: int,
+        prev_log_term: int,
+        entries: List[Dict[str, Any]],
+        leader_commit: int,
+    ) -> Tuple[int, bool]:
         with self.lock:
             # 1. (§5.1) Reply false if term < currentTerm
             if term < self.state.persistent_state.current_term:
@@ -668,9 +675,9 @@ class RaftServer:
             # 2. (§5.3) Reply false if log doesn’t contain an entry at prevLogIndex
             # whose term matches prevLogTerm
             if prev_log_index > 0 and (
-                    len(self.state.persistent_state.log) < prev_log_index or
-                    self.state.persistent_state.log[prev_log_index - 1]["term"]
-                    != prev_log_term
+                len(self.state.persistent_state.log) < prev_log_index
+                or self.state.persistent_state.log[prev_log_index - 1]["term"]
+                != prev_log_term
             ):
                 print(self.state.persistent_state.log)
                 logging.info(
@@ -690,10 +697,12 @@ class RaftServer:
             # NOTE: Assuming that the index and term are monotonically increasing
             for entry in entries:
                 index = entry["index"]
-                if len(self.state.persistent_state.log) <= index:
+                if len(self.state.persistent_state.log) < index:
                     break
-                if self.state.persistent_state.log[index - 1]["term"] != entry["term"]:
-                    self.state.persistent_state.log = self.state.persistent_state.log[:index - 1]
+                if self.state.persistent_state.log[index]["term"] != entry["term"]:
+                    self.state.persistent_state.log = self.state.persistent_state.log[
+                        :index
+                    ]
                     logging.info(
                         f"deleting conflicting entries starting from index {index}"
                     )
@@ -704,14 +713,14 @@ class RaftServer:
                 index = entry["index"]
                 if len(self.state.persistent_state.log) < index:
                     self.state.persistent_state.log.append(entry)
-                    logging.info(
-                        f"appending new entry at index {index}"
-                    )
+                    logging.info(f"appending new entry at index {index}")
 
             # If leaderCommit > commitIndex, set commitIndex =
             # min(leaderCommit, index of last new entry)
             if leader_commit > self.state.commit_index:
-                self.state.commit_index = min(leader_commit, len(self.state.persistent_state.log))
+                self.state.commit_index = min(
+                    leader_commit, len(self.state.persistent_state.log)
+                )
                 logging.info(f"updating commit index to {self.state.commit_index}")
 
         return results
@@ -730,7 +739,7 @@ class RaftServer:
         """
         while self.state.last_applied < self.state.commit_index:
             self.state.last_applied += 1
-            entry = self.state.persistent_state.log[self.state.last_applied - 1]
+            entry = self.state.persistent_state.log[self.state.last_applied]
             command = entry["command"]
             kv_store = KeyValueStore.instance()
             if command["action"] == "SET":
@@ -794,8 +803,7 @@ class RaftServer:
             self.leader_id = self.node_id
             self.state.leader_state = VolatileLeaderState(
                 next_index={
-                    peer: len(self.state.persistent_state.log) + 1
-                    for peer in self.peers
+                    peer: len(self.state.persistent_state.log) for peer in self.peers
                 },
                 match_index={peer: 0 for peer in self.peers},
             )

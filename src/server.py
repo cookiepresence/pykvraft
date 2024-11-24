@@ -17,7 +17,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format=f'[{args.node_id} | %(asctime)s] %(levelname)3s %(message)s', force=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"[{args.node_id} | %(asctime)s] %(levelname)3s %(message)s",
+        force=True,
+    )
 
     node_instance.node_id = args.node_id
     node_instance.port = args.port
