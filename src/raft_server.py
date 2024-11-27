@@ -7,6 +7,7 @@ import random
 import logging
 import json
 import concurrent.futures
+import os
 
 import rpc
 
@@ -51,7 +52,13 @@ class PersistentServerState:
         log (List[Dict[str, Any]]): The log entries. Each entry is a dictionary
                                     containing a command for the state machine
                                     and the term when the entry was received by
-                                    the leader. The first index is atleast 1.
+                                    the leader. The first index is at least 1.
+        snapshot (Optional[Dict[str, Any]]): The latest snapshot of the state
+                                             machine, if any.
+        last_included_index (int): The index of the last log entry included
+                                    in the snapshot.
+        last_included_term (int): The term of the last log entry included
+                                   in the snapshot.
     """
 
     current_term: int = 0
@@ -59,10 +66,13 @@ class PersistentServerState:
     log: List[Dict[str, Any]] = dataclasses.field(
         default_factory=lambda: [{"term": 0, "index": 0, "command": None}]
     )
+    snapshot: Optional[Dict[str, Any]] = None
+    last_included_index: int = 0
+    last_included_term: int = 0
 
     def save(self, filename: str):
         """
-        Saves log to the durable storage.
+        Saves log and snapshot to the durable storage.
 
         Args
             filename (str): specifies where to store the file
@@ -72,13 +82,16 @@ class PersistentServerState:
 
     def load(self, filename: Optional[str]) -> Self:
         """
-        Loads log from durable storage.
+        Loads log and snapshot from durable storage.
 
         Args
-            filename (Optional[str]): specify where to store stuff
+            filename (Optional[str]): specify where to load from
         """
         if filename is None:
-            return
+            return self
+        if not os.path.exists(filename):
+            logging.info(f"No save file found at {filename}. Starting fresh.")
+            return self
         with open(filename, 'r') as save:
             logging.info(f"loading from file {filename}...")
             new_state = json_decode(save.read(), PersistentServerState)
@@ -114,9 +127,9 @@ class ServerState:
         persistent_state (PersistentServerState): The persistent state that is
                                                   stored on durable storage.
         leader_state (Optional[VolatileLeaderState]): The volatile state
-                                                      specific to the leader.
-                                                      Set to None if the server
-                                                      is not a leader.
+                                                    specific to the leader.
+                                                    Set to None if the server
+                                                    is not a leader.
         commit_index (int): The index of the highest log entry known to be
                             committed. Initialized to 0 and increases
                             monotonically.
@@ -185,15 +198,30 @@ class KeyValueStore:
             return value
 
 
+@dataclasses.dataclass
+class Snapshot:
+    """
+    Represents a snapshot of the state machine.
+
+    Attributes:
+        data (Dict[str, Any]): The state machine's state.
+        last_included_index (int): The index of the last log entry included in the snapshot.
+        last_included_term (int): The term of the last log entry included in the snapshot.
+    """
+    data: Dict[str, Any]
+    last_included_index: int
+    last_included_term: int
+
+
 class RaftServer:
     """
     Implements the Raft consensus algorithm to manage a distributed key-value
     store.
 
-    This server handles leader election, log replication, and state machine
-    application to ensure consistency across a cluster of nodes. It interacts
-    with other nodes via RPCs and maintains both persistent and volatile states
-    as defined by the Raft protocol.
+    This server handles leader election, log replication, state machine
+    application, and log compaction to ensure consistency and efficiency
+    across a cluster of nodes. It interacts with other nodes via RPCs and
+    maintains both persistent and volatile states as defined by the Raft protocol.
 
     Attributes:
         node (Node): The singleton instance representing the current node in
@@ -218,14 +246,16 @@ class RaftServer:
         heartbeat_timer (threading.Thread): The thread responsible for sending
                                             heartbeats when the server is the
                                             leader.
+        kv_store (KeyValueStore): The key-value store representing the state machine.
+        snapshot_threshold (int): The log size threshold to trigger a snapshot.
     """
 
     def __init__(
         self,
         node_id: str,
         peers: List[int],
-        min_election_timeout: float = 1000.0,
-        max_election_timeout: float = 2000.0,
+        min_election_timeout: float = 1.0,
+        max_election_timeout: float = 2.0,
         save_file: str = '.save',
         load_from_file: bool = False
     ):
@@ -248,8 +278,8 @@ class RaftServer:
                                           term to last without receiving any
                                           messages, after which an election
                                           would start. (default: 2.0 seconds)
-            load_from_file (Optional[str]): Where to load the log from while
-                                            starting up the the server.
+            load_from_file (Optional[str]): Whether to load the log from a save file
+                                            while starting up the server.
         """
         # TODO: separate it out into a separate class
         self.node_id: str = node_id
@@ -266,7 +296,6 @@ class RaftServer:
         self.max_election_timeout = max_election_timeout
 
         self.leader_id: Optional[str] = None
-        self.election_timeout: float = 0.0
         self.election_timeout: float = self.reset_election_timeout()
         self.heartbeat_interval: float = 0.1
 
@@ -286,7 +315,10 @@ class RaftServer:
 
         self.kv_store = KeyValueStore()
 
-        # requrired for the RPC setup
+        # Snapshot threshold: trigger snapshot after this many log entries
+        self.snapshot_threshold = 5
+
+        # required for the RPC setup
         for attr_name in dir(self):
             attr = getattr(self, attr_name)
             if callable(attr) and hasattr(attr, "rpc_bind_handler"):
@@ -305,17 +337,20 @@ class RaftServer:
         Returns:
             float: The new election timeout timestamp.
         """
-        logging.debug(f"current election timeout: {self.election_timeout}")
-        logging.debug(f"current time: {time.monotonic_ns()}")
-        logging.debug(
-            f"new election timeout: {time.monotonic_ns() + random.uniform(
-            self.min_election_timeout, self.max_election_timeout
-        ) * 1e6}"
-        )
-        return (
-            time.monotonic_ns()
-            + random.uniform(self.min_election_timeout, self.max_election_timeout) * 1e6
-        )
+        # Avoid accessing self.election_timeout during initialization
+        if hasattr(self, 'election_timeout'):
+            logging.debug(f"current election timeout: {self.election_timeout}")
+        else:
+            logging.debug("current election timeout: not set yet")
+
+        current_time_ns = time.monotonic_ns()
+        random_timeout_ns = random.uniform(self.min_election_timeout, self.max_election_timeout) * 1e9
+        new_election_timeout = current_time_ns + random_timeout_ns
+
+        logging.debug(f"current time: {current_time_ns}")
+        logging.debug(f"new election timeout: {new_election_timeout}")
+
+        return new_election_timeout
 
     def run_election_timer(self):
         """
@@ -339,7 +374,8 @@ class RaftServer:
                         self.status == ServerStatus.Candidate
                         or self.status == ServerStatus.Follower
                     ):
-                        if time.monotonic_ns() >= self.election_timeout:
+                        current_time_ns = time.monotonic_ns()
+                        if current_time_ns >= self.election_timeout:
                             threading.Thread(
                                 target=self.start_election, daemon=True
                             ).start()
@@ -365,7 +401,7 @@ class RaftServer:
     def is_incoming_log_up_to_date(
         self, last_log_index: int, last_log_term: int
     ) -> bool:
-        """Checks if incoming log is atleast as up-to-date as the local log.
+        """Checks if incoming log is at least as up-to-date as the local log.
 
         [ref: Raft paper, section 5.4.1, pg 8]
         Raft determines which of two logs is more up-to-date
@@ -449,7 +485,7 @@ class RaftServer:
                     f"(Already voted for {voted_for} in {current_term})"
                 )
                 return (current_term, False)
-            # ...and candidate's log is atleast as up-to-date as receiver's
+            # ...and candidate's log is at least as up-to-date as receiver's
             # log: grant vote
             if (
                 voted_for is None or voted_for == candidate_id
@@ -486,7 +522,7 @@ class RaftServer:
 
     def become_leader(self, term: int) -> None:
         """
-        Convert current server to Leader (while perfoming require checks)
+        Convert current server to Leader (while performing required checks)
 
         Args:
             term (int): term of incoming request
@@ -522,7 +558,7 @@ class RaftServer:
             #  If a follower receives no communication over a period of time
             # called the election timeout, then it assumes there is no vi-
             # able leader and begins an election to choose a new leader.
-            self.election_timer = self.reset_election_timeout()
+            self.election_timeout = self.reset_election_timeout()
 
             # To begin an election, a follower increments its current term...
             self.state.persistent_state.current_term += 1
@@ -532,7 +568,7 @@ class RaftServer:
             # It then votes for itself...
             self.state.persistent_state.voted_for = self.node_id
             # note: implicit vote counted for self.
-            votes_granted = 0
+            votes_granted = 1  # Vote for self
 
             logging.info(
                 f"Node {self.node_id} is now a Candidate for term "
@@ -544,49 +580,51 @@ class RaftServer:
             last_log_term = self.state.persistent_state.log[-1]["term"]
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            for peer, vote in zip(
-                self.peers,
-                executor.map(
+            futures = {
+                executor.submit(
                     self.RequestVote,
-                    self.peers,
-                    [self.state.persistent_state.current_term] * num_peers,
-                    [self.node_id] * num_peers,
-                    [last_log_index] * num_peers,
-                    [last_log_term] * num_peers,
-                ),
-            ):
-                if vote is not None:
-                    (term, vote) = vote
+                    peer,
+                    self.state.persistent_state.current_term,
+                    self.node_id,
+                    last_log_index,
+                    last_log_term,
+                ): peer for peer in self.peers
+            }
+            for future in concurrent.futures.as_completed(futures):
+                peer = futures[future]
+                try:
+                    term, vote = future.result()
                     # (§5.1) [All servers] If RPC request or response contains
                     # term T > currentTerm:
                     # set currentTerm = T, convert to follower
                     if term > current_term:
-                        self.become_follower(current_term)
+                        self.become_follower(term)
                         logging.debug(
                             f"breaking out of the election and returning to Follower "
                             f"(received {term},"
                             f" greater than {current_term})"
                         )
                         break
-                    logging.info(f"vote recieved from {peer}")
-                    votes_granted += 1 if vote else 0
-                    # If at any point we have enough votes for a majority, we
-                    # can proceed with the leader election
-                    if votes_granted > len(self.peers) // 2:
-                        break
-                else:
-                    # Erorred out mid-way, ignore the result
-                    pass
+                    if vote:
+                        logging.info(f"vote received from {peer}")
+                        votes_granted += 1
+                        # If at any point we have enough votes for a majority, we
+                        # can proceed with the leader election
+                        if votes_granted > len(self.peers) // 2:
+                            break
+                except Exception as e:
+                    logging.error(f"Error during voting from peer {peer}: {e}")
 
         # A candidate wins an election if it receives votes from
         # a majority of the servers in the full cluster for the same term
-        if votes_granted > len(self.peers) // 2:
-            self.become_leader(current_term)
-        else:
-            # election failed due to lack of majority (either because of split vote,
-            # or because of the election of another leader)
-            logging.info(f"failed to attain majority in term {current_term}")
-            self.become_follower(current_term)
+        with self.lock:
+            if votes_granted > len(self.peers) // 2:
+                self.become_leader(current_term)
+            else:
+                # election failed due to lack of majority (either because of split vote,
+                # or because of the election of another leader)
+                logging.info(f"failed to attain majority in term {current_term}")
+                self.become_follower(current_term)
 
     def send_heartbeats(self):
         """
@@ -607,67 +645,68 @@ class RaftServer:
             logging.info(f"{prev_log_index=}")
             prev_log_term = [
                 self.state.persistent_state.log[idx - 1]["term"]
+                if idx > 0 else self.state.persistent_state.last_included_term
                 for idx in prev_log_index.values()
             ]
             entries = [
-                self.state.persistent_state.log[idx:] for idx in prev_log_index.values()
+                self.state.persistent_state.log[idx:] if idx <= len(self.state.persistent_state.log) else []
+                for idx in prev_log_index.values()
             ]
             logging.info(f"{entries=}")
             leader_commit = self.state.commit_index
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            for peer, entry, response in zip(
-                self.peers,
-                entries,
-                executor.map(
+            futures = {
+                executor.submit(
                     self.AppendEntries,
-                    peers,
-                    [current_term] * num_peers,
-                    [node_id] * num_peers,
-                    prev_log_index.values(),
-                    prev_log_term,
-                    entries,  # heartbeat does NOT require any entries
-                    [leader_commit] * num_peers,
-                ),
-            ):
-                # something failed midway, can skip
-                if response is None:
-                    continue
-                term, success = response
-                if term > current_term:
-                    logging.info(
-                        f"received higher term {term} in heartbeat, retiring..."
-                    )
-                    self.become_follower(term)
+                    peer,
+                    current_term,
+                    node_id,
+                    list(prev_log_index.values())[i],
+                    prev_log_term[i],
+                    entries[i],
+                    leader_commit,
+                ): peer for i, peer in enumerate(peers)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                peer = futures[future]
+                try:
+                    term, success = future.result()
+                    if term > current_term:
+                        logging.info(
+                            f"received higher term {term} in heartbeat, retiring..."
+                        )
+                        self.become_follower(term)
+                        continue
 
-                with self.lock:
-                    if self.status == ServerStatus.Leader and self.state.persistent_state.current_term == term:
-                        if success:
-                            self.state.leader_state.match_index[peer] = prev_log_index[peer]
-                            self.state.leader_state.next_index[peer] = prev_log_index[
-                                peer
-                            ] + len(entry)
-                            logging.info(
-                                f"successfully replicated to peer {peer} "
-                                f"[match index: {prev_log_index[peer]}, "
-                                f"next_index: {prev_log_index[peer] + len(entry)}]"
-                            )
-                        else:
-                            self.state.leader_state.next_index[peer] = max(
-                                min(
-                                    self.state.leader_state.next_index[peer],
-                                    prev_log_index[peer] - 1,
-                                ),
-                                0,
-                            )
-                        min_match_index = min(self.state.leader_state.match_index.values())
-                        num_safe = len(list(filter(
-                            lambda x: x >= min_match_index,
-                            self.state.leader_state.match_index.values()
-                        )))
-                        if num_safe > len(self.peers) // 2:
-                            self.state.commit_index = max(self.state.commit_index, min_match_index)
-            self.apply_committed_entries()
+                    with self.lock:
+                        if self.status == ServerStatus.Leader and self.state.persistent_state.current_term == term:
+                            if success:
+                                self.state.leader_state.match_index[peer] = list(prev_log_index.values())[self.peers.index(peer)]
+                                self.state.leader_state.next_index[peer] = list(prev_log_index.values())[self.peers.index(peer)] + len(entries[self.peers.index(peer)])
+                                logging.info(
+                                    f"successfully replicated to peer {peer} "
+                                    f"[match index: {self.state.leader_state.match_index[peer]}, "
+                                    f"next_index: {self.state.leader_state.next_index[peer]}]"
+                                )
+                                # Check if a snapshot can be compacted
+                                if len(self.state.persistent_state.log) - self.state.persistent_state.last_included_index > self.snapshot_threshold:
+                                    self.create_snapshot()
+                            else:
+                                self.state.leader_state.next_index[peer] = max(
+                                    1,
+                                    self.state.leader_state.next_index[peer] - 1,
+                                )
+                            min_match_index = min(self.state.leader_state.match_index.values())
+                            num_safe = len([
+                                x for x in self.state.leader_state.match_index.values()
+                                if x >= min_match_index
+                            ])
+                            if num_safe > len(self.peers) // 2:
+                                self.state.commit_index = max(self.state.commit_index, min_match_index)
+                except Exception as e:
+                    logging.error(f"Error during heartbeat to peer {peer}: {e}")
+        self.apply_committed_entries()
 
     @rpc.rpc_call(is_class_method=True)
     def AppendEntries(
@@ -698,6 +737,21 @@ class RaftServer:
             self.leader_id = leader_id
             self.election_timeout = self.reset_election_timeout()
 
+            # Handle snapshot installation if prev_log_index is less than or equal to last_included_index
+            if prev_log_index < self.state.persistent_state.last_included_index:
+                # Leader needs to send snapshot
+                logging.info("Leader has a snapshot to install.")
+                snapshot = {
+                    "data": self.kv_store.store.copy(),
+                    "last_included_index": self.state.persistent_state.last_included_index,
+                    "last_included_term": self.state.persistent_state.last_included_term,
+                }
+                self.state.persistent_state.snapshot = snapshot
+                results = (self.state.persistent_state.current_term, True)
+                self.apply_snapshot(snapshot)
+                self.state.persistent_state.save(self.save_file)
+                return results
+
             # 2. (§5.3) Reply false if log doesn’t contain an entry at prevLogIndex
             # whose term matches prevLogTerm
             if prev_log_index > 0 and (
@@ -706,9 +760,8 @@ class RaftServer:
                 != prev_log_term
             ):
                 logging.info(
-                    "failed to append entires to log; log out of date "
+                    "failed to append entries to log; log out of date "
                     f"[log index: {len(self.state.persistent_state.log)} vs {prev_log_index}] "
-                    # f"[log terms: {self.state.persistent_state.log[prev_log_index - 1]['term']} vs {prev_log_term}"
                 )
                 return (self.state.persistent_state.current_term, False)
 
@@ -748,6 +801,10 @@ class RaftServer:
                 )
                 logging.info(f"updating commit index to {self.state.commit_index}")
 
+            # Check if log compaction is needed
+            if len(self.state.persistent_state.log) - self.state.persistent_state.last_included_index > self.snapshot_threshold:
+                self.create_snapshot()
+
             self.apply_committed_entries()
             self.state.persistent_state.save(self.save_file)
 
@@ -782,6 +839,44 @@ class RaftServer:
                     f"Node {self.node_id} applied command: {command} at index {self.state.last_applied}"
                 )
 
+    def apply_snapshot(self, snapshot: Dict[str, Any]):
+        """
+        Applies a snapshot to the state machine.
+
+        Args:
+            snapshot (Dict[str, Any]): The snapshot data to apply.
+        """
+        with self.lock:
+            self.kv_store.store = snapshot["data"]
+            self.state.persistent_state.last_included_index = snapshot["last_included_index"]
+            self.state.persistent_state.last_included_term = snapshot["last_included_term"]
+            # Truncate the log to the last included index
+            self.state.persistent_state.log = self.state.persistent_state.log[:self.state.persistent_state.last_included_index + 1]
+            logging.info(
+                f"Applied snapshot up to index {self.state.persistent_state.last_included_index}"
+            )
+
+    def create_snapshot(self):
+        """
+        Creates a snapshot of the current state machine and updates the log.
+
+        This method serializes the current state of the key-value store, saves
+        it as a snapshot, and truncates the log up to the snapshot point.
+        """
+        with self.lock:
+            snapshot = Snapshot(
+                data=self.kv_store.store.copy(),
+                last_included_index=len(self.state.persistent_state.log) - 1,
+                last_included_term=self.state.persistent_state.log[-1]["term"],
+            )
+            self.state.persistent_state.snapshot = dataclasses.asdict(snapshot)
+            self.state.persistent_state.last_included_index = snapshot.last_included_index
+            self.state.persistent_state.last_included_term = snapshot.last_included_term
+            # Truncate the log
+            self.state.persistent_state.log = self.state.persistent_state.log[:snapshot.last_included_index + 1]
+            logging.info(f"Created snapshot at index {snapshot.last_included_index}")
+            self.state.persistent_state.save(self.save_file)
+
     def client_set(self, key: str, value: str) -> bool:
         """
         Handles client requests to set a key-value pair in the store.
@@ -813,10 +908,9 @@ class RaftServer:
             logging.info(
                 f"Node {self.node_id} appended SET command to log: {new_entry}"
             )
-            # self.state.commit_index += 1
-            # logging.info(
-            #     f"Node {self.node_id} updates commit_index to {self.state.commit_index}"
-            # )
+            # Check if log size exceeds snapshot threshold
+            if len(self.state.persistent_state.log) - self.state.persistent_state.last_included_index > self.snapshot_threshold:
+                self.create_snapshot()
             self.send_heartbeats()
             return True
 
