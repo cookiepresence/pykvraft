@@ -625,22 +625,36 @@ class RaftServer:
                         f"received higher term {term} in heartbeat, retiring..."
                     )
                     self.become_follower(term)
-                if success:
-                    with self.lock:
-                        self.state.leader_state.match_index[peer] = prev_log_index[peer]
-                        self.state.leader_state.next_index[peer] = prev_log_index[
-                            peer
-                        ] + len(entry)
-                        logging.info(f"successfully replicated to peer {peer}")
-                else:
-                    with self.lock:
-                        self.state.leader_state.next_index[peer] = max(
-                            min(
-                                self.state.leader_state.next_index[peer],
-                                prev_log_index[peer] - 1,
-                            ),
-                            0,
-                        )
+
+                with self.lock:
+                    if self.status == ServerStatus.Leader and self.state.persistent_state.current_term == term:
+                        if success:
+                            self.state.leader_state.match_index[peer] = prev_log_index[peer]
+                            self.state.leader_state.next_index[peer] = prev_log_index[
+                                peer
+                            ] + len(entry)
+                            logging.info(
+                                f"successfully replicated to peer {peer} "
+                                f"[match index: {prev_log_index[peer]}, "
+                                f"next_index: {prev_log_index[peer] + len(entry)}]"
+                            )
+                        else:
+                            self.state.leader_state.next_index[peer] = max(
+                                min(
+                                    self.state.leader_state.next_index[peer],
+                                    prev_log_index[peer] - 1,
+                                ),
+                                0,
+                            )
+                        min_match_index = min(self.state.leader_state.match_index.values())
+                        logging.info(f"{min_match_index=}")
+                        num_safe = len(list(filter(
+                            lambda x: x >= min_match_index,
+                            self.state.leader_state.match_index.values()
+                        )))
+                        logging.info(f"{num_safe=}")
+                        if num_safe > len(self.peers) // 2:
+                            self.state.commit_index = max(self.state.commit_index, min_match_index)
             self.apply_committed_entries()
 
     @rpc.rpc_call(is_class_method=True)
@@ -679,7 +693,6 @@ class RaftServer:
                 or self.state.persistent_state.log[prev_log_index - 1]["term"]
                 != prev_log_term
             ):
-                print(self.state.persistent_state.log)
                 logging.info(
                     "failed to append entires to log; log out of date "
                     f"[log index: {len(self.state.persistent_state.log)} vs {prev_log_index}] "
@@ -697,7 +710,7 @@ class RaftServer:
             # NOTE: Assuming that the index and term are monotonically increasing
             for entry in entries:
                 index = entry["index"]
-                if len(self.state.persistent_state.log) < index:
+                if len(self.state.persistent_state.log) <= index:
                     break
                 if self.state.persistent_state.log[index]["term"] != entry["term"]:
                     self.state.persistent_state.log = self.state.persistent_state.log[
@@ -711,7 +724,7 @@ class RaftServer:
             # 4. Append any new entries not already in the log
             for entry in entries:
                 index = entry["index"]
-                if len(self.state.persistent_state.log) < index:
+                if len(self.state.persistent_state.log) <= index:
                     self.state.persistent_state.log.append(entry)
                     logging.info(f"appending new entry at index {index}")
 
@@ -722,6 +735,8 @@ class RaftServer:
                     leader_commit, len(self.state.persistent_state.log)
                 )
                 logging.info(f"updating commit index to {self.state.commit_index}")
+
+            self.apply_committed_entries()
 
         return results
 
@@ -737,18 +752,25 @@ class RaftServer:
         Raises:
             IndexError: If the log index is out of bounds.
         """
-        while self.state.last_applied < self.state.commit_index:
-            self.state.last_applied += 1
-            entry = self.state.persistent_state.log[self.state.last_applied]
-            command = entry["command"]
+        with self.lock:
             kv_store = KeyValueStore.instance()
-            if command["action"] == "SET":
-                kv_store.set(command["key"], command["value"])
-            elif command["action"] == "GET":
-                pass  # GET commands do not modify the state
-            logging.info(
-                f"Node {self.node_id} applied command: {command} at index {self.state.last_applied}"
-            )
+            logging.info(f"applying committed entries from {self.state.last_applied} to {self.state.commit_index}")
+            logging.info(f"{self.state.persistent_state.log}")
+            while self.state.last_applied < self.state.commit_index:
+                entry = self.state.persistent_state.log[self.state.last_applied]
+                command = entry["command"]
+                self.state.last_applied += 1
+                if command is None:
+                    logging.info("no command received, skipping...")
+                    continue
+                match command["action"]:
+                    case "SET":
+                        kv_store.set(command["key"], command["value"])
+                    case "GET":
+                        pass  # GET commands do not modify the state
+                logging.info(
+                    f"Node {self.node_id} applied command: {command} at index {self.state.last_applied}"
+                )
 
     def client_set(self, key: str, value: str) -> bool:
         """
@@ -774,7 +796,7 @@ class RaftServer:
         with self.lock:
             new_entry = {
                 "term": self.state.persistent_state.current_term,
-                "index": len(self.state.persistent_state.log) + 1,
+                "index": len(self.state.persistent_state.log),
                 "command": {"action": "SET", "key": key, "value": value},
             }
             self.state.persistent_state.log.append(new_entry)
@@ -787,6 +809,26 @@ class RaftServer:
             # )
             self.send_heartbeats()
             return True
+
+    def client_get(self, key: str) -> Optional[str]:
+        """
+        Handles client requests to get value from the KV store.
+
+        Args:
+            key (str): The key to get
+
+        Returns:
+            Optional[str]: None if the key does not exist, and str otherwise
+        """
+        if self.status != ServerStatus.Leader:
+            logging.debug(
+                f"Node {self.node_id} is not the leader (current status: {self.status}). Cannot set key."
+            )
+            return None
+
+        with self.lock:
+            kv_store = KeyValueStore.instance()
+            return kv_store.get(key)
 
     def force_leader(self):
         """
