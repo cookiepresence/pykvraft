@@ -1,6 +1,6 @@
 import enum
 import dataclasses
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Self
 import threading
 import time
 import random
@@ -9,6 +9,8 @@ import json
 import concurrent.futures
 
 import rpc
+
+from mashumaro.codecs.json import json_decode, json_encode
 
 
 class ServerStatus(enum.Enum):
@@ -57,6 +59,30 @@ class PersistentServerState:
     log: List[Dict[str, Any]] = dataclasses.field(
         default_factory=lambda: [{"term": 0, "index": 0, "command": None}]
     )
+
+    def save(self, filename: str):
+        """
+        Saves log to the durable storage.
+
+        Args
+            filename (str): specifies where to store the file
+        """
+        with open(filename, 'w') as save:
+            save.write(json_encode(self, PersistentServerState))
+
+    def load(self, filename: Optional[str]) -> Self:
+        """
+        Loads log from durable storage.
+
+        Args
+            filename (Optional[str]): specify where to store stuff
+        """
+        if filename is None:
+            return
+        with open(filename, 'r') as save:
+            logging.info(f"loading from file {filename}...")
+            new_state = json_decode(save.read(), PersistentServerState)
+        return new_state
 
 
 @dataclasses.dataclass
@@ -217,6 +243,7 @@ class RaftServer:
         peers: List[int],
         min_election_timeout: float = 1000.0,
         max_election_timeout: float = 2000.0,
+        load_from_file: Optional[str] = None
     ):
         """
         Initializes the RaftServer with the given node ID and peer ports.
@@ -237,6 +264,8 @@ class RaftServer:
                                           term to last without receiving any
                                           messages, after which an election
                                           would start. (default: 2.0 seconds)
+            load_from_file (Optional[str]): Where to load the log from while
+                                            starting up the the server.
         """
         # TODO: separate it out into a separate class
         self.node_id: str = node_id
@@ -245,6 +274,8 @@ class RaftServer:
 
         self.status: ServerStatus = ServerStatus.Follower
         self.state: ServerState = ServerState(persistent_state=PersistentServerState())
+        if load_from_file is not None:
+            self.state.persistent_state = self.state.persistent_state.load(load_from_file)
 
         self.min_election_timeout = min_election_timeout
         self.max_election_timeout = max_election_timeout
@@ -647,12 +678,10 @@ class RaftServer:
                                 0,
                             )
                         min_match_index = min(self.state.leader_state.match_index.values())
-                        logging.info(f"{min_match_index=}")
                         num_safe = len(list(filter(
                             lambda x: x >= min_match_index,
                             self.state.leader_state.match_index.values()
                         )))
-                        logging.info(f"{num_safe=}")
                         if num_safe > len(self.peers) // 2:
                             self.state.commit_index = max(self.state.commit_index, min_match_index)
             self.apply_committed_entries()
@@ -754,8 +783,6 @@ class RaftServer:
         """
         with self.lock:
             kv_store = KeyValueStore.instance()
-            logging.info(f"applying committed entries from {self.state.last_applied} to {self.state.commit_index}")
-            logging.info(f"{self.state.persistent_state.log}")
             while self.state.last_applied < self.state.commit_index:
                 entry = self.state.persistent_state.log[self.state.last_applied]
                 command = entry["command"]
