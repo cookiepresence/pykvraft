@@ -14,7 +14,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--port", type=int, required=True, help="Port to listen on")
     parser.add_argument("--peers", nargs="+", type=int, help="List of peer ports")
-    parser.add_argument("--save-file", dest="save_file", help="Location of saved file", const=None, type=str)
+    parser.add_argument("--save-file", dest="save_file", help="Location of save file", const=None, type=str)
+    parser.add_argument("--load", help="if True, loads from save file", action=argparse.BooleanOptionalAction)
 
     args = parser.parse_args()
 
@@ -28,7 +29,7 @@ if __name__ == "__main__":
     node_instance.port = args.port
     node_instance.peers = args.peers
 
-    raft = raft_server.RaftServer(node_id=args.node_id, peers=args.peers, load_from_file=args.save_file)
+    raft = raft_server.RaftServer(node_id=args.node_id, peers=args.peers, save_file=args.save_file, load_from_file=args.load)
 
     node_instance.raft_server = raft
 

@@ -243,7 +243,8 @@ class RaftServer:
         peers: List[int],
         min_election_timeout: float = 1000.0,
         max_election_timeout: float = 2000.0,
-        load_from_file: Optional[str] = None
+        save_file: str = '.save',
+        load_from_file: bool = False
     ):
         """
         Initializes the RaftServer with the given node ID and peer ports.
@@ -274,8 +275,9 @@ class RaftServer:
 
         self.status: ServerStatus = ServerStatus.Follower
         self.state: ServerState = ServerState(persistent_state=PersistentServerState())
-        if load_from_file is not None:
-            self.state.persistent_state = self.state.persistent_state.load(load_from_file)
+        self.save_file = save_file
+        if load_from_file:
+            self.state.persistent_state = self.state.persistent_state.load(self.save_file)
 
         self.min_election_timeout = min_election_timeout
         self.max_election_timeout = max_election_timeout
@@ -766,6 +768,7 @@ class RaftServer:
                 logging.info(f"updating commit index to {self.state.commit_index}")
 
             self.apply_committed_entries()
+            self.state.persistent_state.save(self.save_file)
 
         return results
 
