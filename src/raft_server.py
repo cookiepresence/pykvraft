@@ -141,8 +141,6 @@ class KeyValueStore:
     thread-safe and consistent across different nodes.
 
     Attributes:
-        _instance (Optional[KeyValueStore]): The singleton instance of the
-                                             KeyValueStore.
         _lock (threading.Lock): A class-level lock to ensure thread-safe
                                 singleton instantiation.
         store (Dict[str, str]): The dictionary storing key-value pairs.
@@ -150,26 +148,11 @@ class KeyValueStore:
                                access to the store.
     """
 
-    _instance = None
     _lock = threading.Lock()
 
     def __init__(self):
         self.store: Dict[str, str] = {}
         self.lock = threading.Lock()
-
-    @classmethod
-    def instance(cls):
-        """
-        Retrieves the singleton instance of the KeyValueStore.
-        If the instance does not exist, it creates one in a thread-safe manner.
-
-        Returns:
-            KeyValueStore: The singleton instance of the KeyValueStore.
-        """
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = cls()
-            return cls._instance
 
     def set(self, key: str, value: str):
         """
@@ -301,6 +284,8 @@ class RaftServer:
         )
         self.heartbeat_timer.start()
 
+        self.kv_store = KeyValueStore()
+
         # requrired for the RPC setup
         for attr_name in dir(self):
             attr = getattr(self, attr_name)
@@ -343,10 +328,6 @@ class RaftServer:
         """
         logging.info("starting election timer!")
         while self.running:
-            # NOTE: likely bug! the election blocks the running of the timer, killing it
-            # in the process. ideally, we would want the election to be on a separate
-            # thread. The election thread can run independently, and only change states
-            # by acquiring locks
             if (
                 self.status == ServerStatus.Candidate
                 or self.status == ServerStatus.Follower
@@ -785,7 +766,6 @@ class RaftServer:
             IndexError: If the log index is out of bounds.
         """
         with self.lock:
-            kv_store = KeyValueStore.instance()
             while self.state.last_applied < self.state.commit_index:
                 entry = self.state.persistent_state.log[self.state.last_applied]
                 command = entry["command"]
@@ -795,7 +775,7 @@ class RaftServer:
                     continue
                 match command["action"]:
                     case "SET":
-                        kv_store.set(command["key"], command["value"])
+                        self.kv_store.set(command["key"], command["value"])
                     case "GET":
                         pass  # GET commands do not modify the state
                 logging.info(
@@ -857,8 +837,7 @@ class RaftServer:
             return None
 
         with self.lock:
-            kv_store = KeyValueStore.instance()
-            return kv_store.get(key)
+            return self.kv_store.get(key)
 
     def force_leader(self):
         """

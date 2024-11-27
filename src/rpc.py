@@ -179,33 +179,3 @@ def Hello(name: str) -> str:
 
     time.sleep(10)
     return f"Hello {name}!"
-
-
-@rpc_call()
-def Set(key: str, value: str) -> bool:
-    """
-    RPC method to set a key-value pair in the KV store.
-    Returns True if successful, False otherwise.
-    """
-    raft = node.Node.instance().raft_server
-    if raft:
-        success = raft.client_set(key, value)
-        return success
-    else:
-        logging.error("RaftServer instance is not initialized.")
-        return False
-
-
-@rpc_call()
-def Get(key: str) -> Optional[str]:
-    """
-    RPC method to get the value of a key from the KV store.
-    Returns the value if found, None otherwise.
-    """
-    raft = node.Node.instance().raft_server
-    if raft:
-        value = raft.client_get(key)
-        return value
-    else:
-        logging.error("RaftServer instance is not initialized.")
-        return None
