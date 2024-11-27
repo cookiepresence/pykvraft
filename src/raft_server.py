@@ -830,12 +830,6 @@ class RaftServer:
         Returns:
             Optional[str]: None if the key does not exist, and str otherwise
         """
-        if self.status != ServerStatus.Leader:
-            logging.debug(
-                f"Node {self.node_id} is not the leader (current status: {self.status}). Cannot set key."
-            )
-            return None
-
         with self.lock:
             return self.kv_store.get(key)
 
