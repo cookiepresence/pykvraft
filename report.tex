@@ -1,0 +1,56 @@
+% Created 2024-11-28 Thu 08:14
+% Intended LaTeX compiler: pdflatex
+\documentclass[11pt]{article}
+\usepackage{mathtools}
+\usepackage[latin1]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{wrapfig}
+\usepackage{rotating}
+\usepackage[normalem]{ulem}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{capt-of}
+\usepackage{hyperref}
+\usepackage{custompreamble}
+\author{Monish (2022111003); Rishabh (2023121001)}
+\date{\today}
+\title{Project Report\\\medskip
+\large Team 73: Replicated Fault Tolerant Key Value Store}
+\hypersetup{
+ pdfauthor={Monish (2022111003); Rishabh (2023121001)},
+ pdftitle={Project Report},
+ pdfkeywords={},
+ pdfsubject={},
+ pdfcreator={Emacs 30.0.91 (Org mode 9.7.11)}, 
+ pdflang={English}}
+\begin{document}
+
+\maketitle
+\tableofcontents
+
+\section{What is Raft?}
+\label{sec:orge266d73}
+The project was an attempt at making a fault-tolerant key value store. To replicate the various nodes and ensure that they are consistent, we use Raft (Ongaro, Diego and Ousterhout, John, 2014), an alterantive to Multi-Paxos (Lamport, Leslie, 1998) that is touted to be simpler to understand and implement. One key difference between Multi-Paxos and raft is the strong leader property, which enforces the logs of the leader on all of the follower nodes to ensure that all nodes are synced. This ensures that there are no updates lost on the way.
+
+Raft is not intended for fully replacing a key-value store, rather using it as a fundamental building block on top of other services (for example: lock services, configuration, etc.). This is because all updates for Raft have to pass through the leader, which creates a bottleneck for cluster. Raft also errs towards consistency over availablilty, further impacting performance.
+\section{Our Implementation}
+\label{sec:org0e36952}
+We implemented Raft in Python, primarily due to the flexibility offered by it, as well as the familiarity. The bulk of the code involving the implementation of Raft is present in \texttt{raft\_server.py}
+\section{Benchmarks}
+\label{sec:org71dbd9c}
+
+\section{Conclusion}
+\label{sec:org28928df}
+While it is an easy algorithm to understand and implement, it is not a replacement for the Paxos protocol. There are several improvements that Paxos has seen that can be translated to a modified protocol for Raft.
+
+However, Raft is successful in its own right, due to its simplicity and orthogonality of concerns, being widely deployed and used
+\section{Bibliography}
+\label{sec:orgc8975df}
+\noindent
+Lamport, Leslie (1998). \emph{The Part-Time Parliament}, ACM Trans. Comput. Syst..
+
+\noindent
+Ongaro, Diego and Ousterhout, John (2014). \emph{In Search of an Understandable Consensus Algorithm}, USENIX Association.
+\end{document}

@@ -79,6 +79,8 @@ if __name__ == "__main__":
                     print("This node has been set as Leader.")
                 case ["save", filename]:
                     raft.state.persistent_state.save(filename)
+                case ["exec", *cmd]:
+                    exec(' '.join(cmd))
                 case _:
                     print(
                         "Unknown command. Use 'send <target_port> to <endpoint> <message>', 'stop', 'set <key> <value>', 'get <key>', or 'make-leader'."

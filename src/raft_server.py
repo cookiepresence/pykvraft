@@ -455,6 +455,8 @@ class RaftServer:
             current_term = self.state.persistent_state.current_term
             voted_for = self.state.persistent_state.voted_for
 
+            logging.info(f"before granting votes: {voted_for=}, {current_term=}")
+
             # (§5.1) Reply false if term < current term
             if term < current_term:
                 logging.debug(
@@ -491,6 +493,7 @@ class RaftServer:
                 voted_for is None or voted_for == candidate_id
             ) and self.is_incoming_log_up_to_date(last_log_index, last_log_term):
                 logging.info(f"Vote granted to {candidate_id}")
+                self.state.persistent_state.voted_for = candidate_id
                 self.reset_election_timeout()
                 return (current_term, True)
             else:
@@ -733,6 +736,7 @@ class RaftServer:
             if term > self.state.persistent_state.current_term:
                 self.state.persistent_state.current_term = term
                 self.state.persistent_state.voted_for = None
+                self.status = ServerStatus.Follower
 
             self.leader_id = leader_id
             self.election_timeout = self.reset_election_timeout()

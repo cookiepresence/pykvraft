@@ -1,0 +1,25 @@
+#+TITLE: Project Report
+#+SUBTITLE: Team 73: Replicated Fault Tolerant Key Value Store
+#+AUTHOR: Monish (2022111003); Rishabh (2023121001)
+
+#+LATEX_HEADER: \usepackage{custompreamble}
+
+#+bibliography: citations.bib
+
+* What is Raft?
+The project was an attempt at making a fault-tolerant key value store. To replicate the various nodes and ensure that they are consistent, we use Raft [cite:@ongaroSearchUnderstandableConsensus2014], an alterantive to Multi-Paxos [cite:@lamportParttimeParliament1998] that is touted to be simpler to understand and implement. One key difference between Multi-Paxos and raft is the strong leader property, which enforces the logs of the leader on all of the follower nodes to ensure that all nodes are synced. This ensures that there are no updates lost on the way.
+
+Raft is not intended for fully replacing a key-value store, rather using it as a fundamental building block on top of other services (for example: lock services, configuration, etc.). This is because all updates for Raft have to pass through the leader, which creates a bottleneck for cluster. Raft also errs towards consistency over availablilty, further impacting performance.
+
+* Our Implementation
+We implemented Raft in Python, primarily due to the flexibility offered by it, as well as the familiarity. The bulk of the code involving the implementation of Raft is present in =raft_server.py=
+
+* Benchmarks
+
+* Conclusion
+While it is an easy algorithm to understand and implement, it is not a replacement for the Paxos protocol. There are several improvements that Paxos has seen that can be translated to a modified protocol for Raft.
+
+However, Raft is successful in its own right, due to its simplicity and orthogonality of concerns, being widely deployed and used
+
+* Bibliography
+#+PRINT_BIBLIOGRAPHY: 
